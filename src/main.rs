@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::process;
 
 use hsbc_monte_carlo_auto_callable::{
     analytics::BenchmarkReport,
@@ -27,11 +28,77 @@ const BUSINESS_DAYS_PER_MONTH: usize = 21; // ~21 daily sub-steps per month
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+const ALL_STRATEGIES: &[ConcurrencyStrategy] = &[
+    ConcurrencyStrategy::NaiveSpawn,
+    ConcurrencyStrategy::SpawnBlockingJoinSet,
+    ConcurrencyStrategy::RayonBridge,
+    ConcurrencyStrategy::SemaphoreBounded,
+    ConcurrencyStrategy::ChannelPipeline,
+    ConcurrencyStrategy::StreamBuffered,
+    ConcurrencyStrategy::StreamThrottled,
+];
+
+fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
+    match arg.to_lowercase().trim_start_matches('s') {
+        "1" | "naive_spawn"             => Some(ConcurrencyStrategy::NaiveSpawn),
+        "2" | "spawn_blocking_joinset"  => Some(ConcurrencyStrategy::SpawnBlockingJoinSet),
+        "3" | "rayon_bridge"            => Some(ConcurrencyStrategy::RayonBridge),
+        "4" | "semaphore_bounded"       => Some(ConcurrencyStrategy::SemaphoreBounded),
+        "5" | "channel_pipeline"        => Some(ConcurrencyStrategy::ChannelPipeline),
+        "6" | "stream_buffered"         => Some(ConcurrencyStrategy::StreamBuffered),
+        "7" | "stream_throttled"        => Some(ConcurrencyStrategy::StreamThrottled),
+        _ => None,
+    }
+}
+
+fn print_usage() {
+    eprintln!("Usage: monte-carlo-auto-callable [STRATEGY]");
+    eprintln!();
+    eprintln!("  STRATEGY  (omit to run all)");
+    eprintln!("    s1  naive_spawn");
+    eprintln!("    s2  spawn_blocking_joinset");
+    eprintln!("    s3  rayon_bridge");
+    eprintln!("    s4  semaphore_bounded");
+    eprintln!("    s5  channel_pipeline");
+    eprintln!("    s6  stream_buffered");
+    eprintln!("    s7  stream_throttled");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  cargo run --release                  # all strategies");
+    eprintln!("  cargo run --release -- s3             # rayon_bridge only");
+    eprintln!("  cargo run --release -- rayon_bridge   # same");
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("warn")
         .init();
+
+    // Parse optional strategy argument
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let selected: Vec<ConcurrencyStrategy> = match args.as_slice() {
+        [] => ALL_STRATEGIES.to_vec(),
+        [arg] if arg == "--help" || arg == "-h" => {
+            print_usage();
+            process::exit(0);
+        }
+        [arg] => match parse_strategy(arg) {
+            Some(s) => vec![s],
+            None => {
+                eprintln!("error: unknown strategy '{arg}'");
+                eprintln!();
+                print_usage();
+                process::exit(1);
+            }
+        },
+        _ => {
+            eprintln!("error: at most one argument expected");
+            eprintln!();
+            print_usage();
+            process::exit(1);
+        }
+    };
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
     println!("║    HSBC Monte Carlo Auto-Callable Pricing Engine — Benchmark Harness     ║");
@@ -49,12 +116,9 @@ async fn main() {
 
     let market_data = MarketData::new(SPOT_INITIAL, VOLATILITY, RISK_FREE_RATE, DIVIDEND_YIELD);
 
-    // Monthly coupon schedule: 5% per year annualised → 5%/12 per month
     let coupons: Vec<f64> = (1..=N_MONTHLY)
         .map(|k| 0.05 * k as f64 / N_MONTHLY as f64)
         .collect();
-
-    // Monthly observation dates in years
     let obs_dates: Vec<f64> = (1..=N_MONTHLY)
         .map(|k| MATURITY_YEARS * k as f64 / N_MONTHLY as f64)
         .collect();
@@ -68,8 +132,8 @@ async fn main() {
         obs_dates,
     );
 
-    let propagator  = Arc::new(BlackScholes::new(&market_data));
-    let time_grid   = DualTimeGrid::new(MATURITY_YEARS, N_MONTHLY, BUSINESS_DAYS_PER_MONTH);
+    let propagator   = Arc::new(BlackScholes::new(&market_data));
+    let time_grid    = DualTimeGrid::new(MATURITY_YEARS, N_MONTHLY, BUSINESS_DAYS_PER_MONTH);
     let barrier_call = SPOT_INITIAL * BARRIER_CALL_FRAC;
     let barrier_ki   = SPOT_INITIAL * BARRIER_KI_FRAC;
 
@@ -86,19 +150,9 @@ async fn main() {
         )
     );
 
-    let strategies = [
-        ConcurrencyStrategy::NaiveSpawn,
-        ConcurrencyStrategy::SpawnBlockingJoinSet,
-        ConcurrencyStrategy::RayonBridge,
-        ConcurrencyStrategy::SemaphoreBounded,
-        ConcurrencyStrategy::ChannelPipeline,
-        ConcurrencyStrategy::StreamBuffered,
-        ConcurrencyStrategy::StreamThrottled,
-    ];
-
     let mut report = BenchmarkReport::default();
 
-    for strategy in &strategies {
+    for strategy in &selected {
         print!("  Running {:30} ... ", strategy.name());
         let result = run_simulation(
             *strategy,
