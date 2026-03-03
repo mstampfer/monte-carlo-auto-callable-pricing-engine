@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::process;
 
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
 use hsbc_monte_carlo_auto_callable::{
     analytics::BenchmarkReport,
     concurrency::{run_simulation, ConcurrencyStrategy},
@@ -89,8 +91,18 @@ fn print_usage() {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("warn")
+    // console-subscriber (tokio-console gRPC layer) + fmt layer share a Registry.
+    // tokio-console requires: RUSTFLAGS="--cfg tokio_unstable" at compile time.
+    let console_layer = console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .spawn();
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_filter(EnvFilter::new("warn")),
+        )
         .init();
 
     // Parse arguments: [--npaths N] [STRATEGY]
