@@ -23,3 +23,16 @@ criterion = { version = "0.5", features = ["html_reports"] }
 opt-level = 3
 lto       = "fat"
 codegen-units = 1
+
+# tokio-console profile: fast enough for realistic timings, but deliberately
+# avoids fat-LTO and single-CGU so that tokio's instrumentation hooks survive
+# the linker.  Use this instead of --release when observing with tokio-console.
+#
+#   cargo run --profile console -- --npaths 50_000_000 s2
+#
+[profile.console]
+inherits      = "release"
+opt-level     = 2          # slightly less aggressive — keeps more debug hooks
+lto           = "thin"     # thin LTO still inlines across crates but preserves stubs
+codegen-units = 16         # multiple CGUs → tokio's __tokio_task_id stubs are not elided
+debug         = 1          # line numbers → meaningful stack traces in the TUI
