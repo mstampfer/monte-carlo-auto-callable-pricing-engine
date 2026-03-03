@@ -10,7 +10,7 @@ use hsbc_monte_carlo_auto_callable::{
 
 // ── Simulation parameters ────────────────────────────────────────────────────
 
-const N_PATHS:             usize = 500_000;
+const DEFAULT_N_PATHS:     usize = 200_000;
 const N_THREADS:           usize = 8;
 const GLOBAL_SEED:         u64   = 42;
 
@@ -38,6 +38,20 @@ const ALL_STRATEGIES: &[ConcurrencyStrategy] = &[
     ConcurrencyStrategy::StreamThrottled,
 ];
 
+fn parse_npaths(s: &str) -> Result<usize, String> {
+    // Accept Rust-style underscore separators: "75_000_000", "75000000"
+    let cleaned: String = s.chars().filter(|&c| c != '_').collect();
+    cleaned.parse::<usize>()
+        .map_err(|_| format!("'{}' is not a valid integer", s))
+        .and_then(|n| {
+            if n == 0 {
+                Err("--npaths must be greater than zero".into())
+            } else {
+                Ok(n)
+            }
+        })
+}
+
 fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
     match arg.to_lowercase().trim_start_matches('s') {
         "1" | "naive_spawn"             => Some(ConcurrencyStrategy::NaiveSpawn),
@@ -52,7 +66,11 @@ fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
 }
 
 fn print_usage() {
-    eprintln!("Usage: monte-carlo-auto-callable [STRATEGY]");
+    eprintln!("Usage: monte-carlo-auto-callable [--npaths N] [STRATEGY]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --npaths N    Number of Monte Carlo paths (default: {DEFAULT_N_PATHS})");
+    eprintln!("                Underscores accepted: 75_000_000 or 75000000");
     eprintln!();
     eprintln!("  STRATEGY  (omit to run all)");
     eprintln!("    s1  naive_spawn");
@@ -64,9 +82,9 @@ fn print_usage() {
     eprintln!("    s7  stream_throttled");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  cargo run --release                  # all strategies");
-    eprintln!("  cargo run --release -- s3             # rayon_bridge only");
-    eprintln!("  cargo run --release -- rayon_bridge   # same");
+    eprintln!("  cargo run --release                             # all, 200_000 paths");
+    eprintln!("  cargo run --release -- --npaths 500_000         # all, 500_000 paths");
+    eprintln!("  cargo run --release -- --npaths 75_000_000 s3   # rayon_bridge, 75M paths");
 }
 
 #[tokio::main]
@@ -75,14 +93,36 @@ async fn main() {
         .with_env_filter("warn")
         .init();
 
-    // Parse optional strategy argument
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let selected: Vec<ConcurrencyStrategy> = match args.as_slice() {
-        [] => ALL_STRATEGIES.to_vec(),
-        [arg] if arg == "--help" || arg == "-h" => {
-            print_usage();
-            process::exit(0);
+    // Parse arguments: [--npaths N] [STRATEGY]
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut args = raw.as_slice();
+
+    if args.first().map(|s| s == "--help" || s == "-h").unwrap_or(false) {
+        print_usage();
+        process::exit(0);
+    }
+
+    // --npaths N  (accepts "500_000" or "500000")
+    let n_paths: usize = if args.first().map(|s| s == "--npaths").unwrap_or(false) {
+        match args.get(1) {
+            Some(val) => match parse_npaths(val) {
+                Ok(n)  => { args = &args[2..]; n }
+                Err(e) => { eprintln!("error: {e}"); eprintln!(); print_usage(); process::exit(1); }
+            },
+            None => {
+                eprintln!("error: --npaths requires a value");
+                eprintln!();
+                print_usage();
+                process::exit(1);
+            }
         }
+    } else {
+        DEFAULT_N_PATHS
+    };
+
+    // Optional strategy name/number
+    let selected: Vec<ConcurrencyStrategy> = match args {
+        [] => ALL_STRATEGIES.to_vec(),
         [arg] => match parse_strategy(arg) {
             Some(s) => vec![s],
             None => {
@@ -93,7 +133,7 @@ async fn main() {
             }
         },
         _ => {
-            eprintln!("error: at most one argument expected");
+            eprintln!("error: unexpected arguments: {}", args.join(" "));
             eprintln!();
             print_usage();
             process::exit(1);
@@ -110,7 +150,7 @@ async fn main() {
     println!("  Barriers   : Call = {:.0}% of S_0, KI = {:.0}% of S_0",
         BARRIER_CALL_FRAC * 100.0, BARRIER_KI_FRAC * 100.0);
     println!("  Grid       : {N_MONTHLY} monthly x {BUSINESS_DAYS_PER_MONTH} daily sub-steps");
-    println!("  Paths      : {N_PATHS}, Threads = {N_THREADS}");
+    println!("  Paths      : {n_paths}, Threads = {N_THREADS}");
     println!("  Method     : One-Step Survival (Glasserman-Staum) + Brownian Bridge");
     println!();
 
@@ -157,7 +197,7 @@ async fn main() {
         let result = run_simulation(
             *strategy,
             Arc::clone(&engine),
-            N_PATHS,
+            n_paths,
             N_THREADS,
             GLOBAL_SEED,
         ).await;
@@ -169,11 +209,11 @@ async fn main() {
 
     // ── Greeks via finite difference ─────────────────────────────────────────
     println!("\n── Delta (finite difference, bump = 1% of S_0) ─────────────────────────");
-    compute_delta(&engine, market_data, N_PATHS, GLOBAL_SEED).await;
+    compute_delta(&engine, market_data, n_paths, GLOBAL_SEED).await;
 
     // ── AmericanOption stub — demonstrates plug-in genericity ────────────────
     println!("\n── AmericanOption stub (Bermudan approximation, same engine) ────────────");
-    price_american_option(market_data, N_PATHS / 10, N_THREADS, GLOBAL_SEED).await;
+    price_american_option(market_data, (n_paths / 10).max(1), N_THREADS, GLOBAL_SEED).await;
 }
 
 async fn compute_delta(
