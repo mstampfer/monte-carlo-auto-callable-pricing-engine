@@ -39,7 +39,19 @@ where
     throttled
         .map(|cfg| {
             let eng = Arc::clone(&engine);
-            tokio::task::spawn_blocking(move || eng.run_batch(&cfg))
+            tokio::task::spawn_blocking(move || {
+                let span = tracing::info_span!("batch",
+                    batch_id = cfg.batch_id as u64,
+                    n_paths  = cfg.n_paths  as u64,
+                    price    = tracing::field::Empty,
+                    std_err  = tracing::field::Empty,
+                );
+                let _guard = span.enter();
+                let result  = eng.run_batch(&cfg);
+                span.record("price",   result.price());
+                span.record("std_err", result.std_err());
+                result
+            })
         })
         .buffer_unordered(n_threads)
         .map(|r: Result<PartialResult, tokio::task::JoinError>| {

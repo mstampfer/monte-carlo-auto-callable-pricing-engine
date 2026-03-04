@@ -29,7 +29,7 @@ where
     P:  Product,
     Pr: Propagator,
 {
-    let (batch_tx, batch_rx) = mpsc::channel::<BatchConfig>(QUEUE_DEPTH);
+    let (batch_tx,  batch_rx)  = mpsc::channel::<BatchConfig>(QUEUE_DEPTH);
     let (result_tx, result_rx) = mpsc::channel::<PartialResult>(QUEUE_DEPTH);
 
     // Producer: send all batch configs into the batch channel.
@@ -47,8 +47,8 @@ where
 
     // Worker pool: each worker runs in a blocking thread.
     for _ in 0..n_workers {
-        let rx = Arc::clone(&batch_rx);
-        let tx = result_tx.clone();
+        let rx  = Arc::clone(&batch_rx);
+        let tx  = result_tx.clone();
         let eng = Arc::clone(&engine);
 
         tokio::task::spawn_blocking(move || {
@@ -60,7 +60,16 @@ where
                 };
                 match cfg {
                     Some(cfg) => {
-                        let result = eng.run_batch(&cfg);
+                        let span = tracing::info_span!("batch",
+                            batch_id = cfg.batch_id as u64,
+                            n_paths  = cfg.n_paths  as u64,
+                            price    = tracing::field::Empty,
+                            std_err  = tracing::field::Empty,
+                        );
+                        let _guard = span.enter();
+                        let result  = eng.run_batch(&cfg);
+                        span.record("price",   result.price());
+                        span.record("std_err", result.std_err());
                         if tx.blocking_send(result).is_err() {
                             break;
                         }

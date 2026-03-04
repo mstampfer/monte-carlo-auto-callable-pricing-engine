@@ -5,6 +5,8 @@ use crate::simulation::BoxMullerRng;
 /// Passed by value into `spawn_blocking` / `rayon::spawn` — must be `Send + 'static`.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
+    /// Unique batch index (0-based) within the simulation run.
+    pub batch_id: usize,
     /// Number of paths to simulate in this batch.
     pub n_paths: usize,
     /// RNG seed for this batch (unique per batch, derived from global seed + batch id).
@@ -12,8 +14,8 @@ pub struct BatchConfig {
 }
 
 impl BatchConfig {
-    pub fn new(n_paths: usize, seed: u64) -> Self {
-        Self { n_paths, seed }
+    pub fn new(batch_id: usize, n_paths: usize, seed: u64) -> Self {
+        Self { batch_id, n_paths, seed }
     }
 }
 

@@ -12,11 +12,20 @@ The instrument priced is an **autocallable note with daily knock-in monitoring a
 # Build optimised binary (fat LTO, codegen-units=1)
 cargo build --release
 
-# Run the benchmark harness
+# Run the benchmark harness (all 7 concurrency strategies)
 cargo run --release
+
+# Run with a specific strategy or path count
+cargo run --release -- --npaths 2_000_000 s3
+
+# Launch the post-run profiler TUI
+cargo run --release --bin profiler
+
+# Profiler with 64 batches across selected strategies
+cargo run --release --bin profiler -- --nbatches 64 s1 s3 s6 s7
 ```
 
-Sample output:
+Sample benchmark output:
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
@@ -27,27 +36,89 @@ Sample output:
   S_0        : 100, σ = 25%, r = 5%, q = 2%
   Barriers   : Call = 100% of S_0, KI = 70% of S_0
   Grid       : 12 monthly x 21 daily sub-steps
-  Paths      : 500000, Threads = 8
+  Paths      : 200000, Threads = 8
   Method     : One-Step Survival (Glasserman-Staum) + Brownian Bridge
 
 ╔════════════════════════════════╦══════════╦═══════════╦══════════╦══════════════════╦═════════╗
 ║ Strategy                       ║    Paths ║ Time (ms) ║    Price ║      95% CI      ║ Speedup ║
 ╠════════════════════════════════╬══════════╬═══════════╬══════════╬══════════════════╬═════════╣
-║ S1  naive_spawn                ║     500K ║       310 ║   96.732 ║ [ 96.72, 96.75] ║    1.0× ║
-║ S2  spawn_blocking_joinset     ║     500K ║       307 ║   96.732 ║ [ 96.72, 96.75] ║    1.0× ║
-║ S3  rayon_bridge               ║     500K ║       307 ║   96.732 ║ [ 96.72, 96.75] ║    1.0× ║
-║ S4  semaphore_bounded(8)       ║     500K ║       304 ║   96.732 ║ [ 96.72, 96.75] ║    1.0× ║
-║ S5  channel_pipeline(8)        ║     500K ║       304 ║   96.732 ║ [ 96.72, 96.75] ║    1.0× ║
-║ S6  stream_buffered(8)         ║     500K ║       298 ║   96.732 ║ [ 96.72, 96.75] ║    1.0× ║
-║ S7  stream_throttled(8,10ms)   ║     500K ║       361 ║   96.732 ║ [ 96.72, 96.75] ║    0.9× ║
+║ S1  naive_spawn                ║     200K ║       127 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
+║ S2  spawn_blocking_joinset     ║     200K ║       124 ║   96.734 ║ [ 96.71, 96.76] ║    1.2× ║
+║ S3  rayon_bridge               ║     200K ║       123 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
+║ S4  semaphore_bounded(8)       ║     200K ║       124 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
+║ S5  channel_pipeline(8)        ║     200K ║       126 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
+║ S6  stream_buffered(8)         ║     200K ║       126 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
+║ S7  stream_throttled(8,10ms)   ║     200K ║       183 ║   96.734 ║ [ 96.71, 96.76] ║    0.7× ║
 ╚════════════════════════════════╩══════════╩═══════════╩══════════╩══════════════════╩═════════╝
 
-── Delta (finite difference, bump = 1% of S_0) ─────────────────────────
-  bump = 1.0%  →  Δ = 0.4809
-  bump = 0.1%  →  Δ = 0.4819
+── AmericanOption stub (Bermudan approximation, same engine) ────────────
+  AmericanOption (Bermudan approx): price = 3.226,  95% CI = [3.173, 3.280]
 ```
 
-All seven strategies converge to the same price within each other's 95% confidence intervals, validating the OSS estimator. S7 is intentionally slower — the 10 ms/batch throttle adds ~80 ms of artificial delay to demonstrate the rate-limiting mechanism.
+All seven strategies converge to the same price within each other's 95% confidence intervals, validating the OSS estimator. S7 is intentionally slower — the 10 ms/batch throttle adds overhead proportional to the batch count to demonstrate the rate-limiting mechanism.
+
+---
+
+## Profiler TUI
+
+The `profiler` binary runs the same simulation and renders a post-run ratatui TUI that reveals *how* each strategy used its threads. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing and thread identity with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation).
+
+```bash
+# Default: all 7 strategies, 200K paths, 32 batches (4× threads — exposes work-stealing)
+cargo run --release --bin profiler
+
+# More paths for sharper timelines
+cargo run --release --bin profiler -- --npaths 2_000_000
+
+# More batches to make strategy differences visible
+cargo run --release --bin profiler -- --nbatches 64 s1 s3 s6 s7
+```
+
+### Tab 1 — Thread Timelines
+
+Gantt chart for each strategy. Each row is one OS thread; each coloured block is one batch (colour = `batch_id`). Grey `░` = idle.
+
+```
+▶ S3  rayon_bridge   111 ms
+  T0 [████████░░░████████████░░░░░████████████████░░░]
+  T1 [░░████████████████░░░░████████████████████████░]
+  ...
+  CPU eff: 95%  Imbalance: 1.95  Batches: 64  Price: 96.740
+```
+
+Keys: `↑`/`↓` scroll, `Tab`/`1`/`2`/`3` switch tabs, `q`/`Esc` quit.
+
+### Tab 2 — Batch Analysis
+
+For a selected strategy (chosen with `↑`/`↓`):
+
+- **Duration histogram** — sparkline of batch compute-time distribution
+- **Batch-to-thread matrix** — which thread ran which batch (`●`)
+- **Completion order** — batch IDs sorted by finish time; out-of-order = work-stealing or async scheduling visible
+
+### Tab 3 — Convergence & Comparison
+
+- **Price convergence sparkline** — running price after each batch completion
+- **Strategy comparison table** — wall time, price, CPU efficiency %, load imbalance index, speedup vs S1
+
+### Key metrics
+
+| Metric | Formula |
+|---|---|
+| CPU efficiency | Σ(batch durations) / (wall time × unique threads) |
+| Load imbalance | max(batch duration) / mean(batch duration) |
+| Throughput | total paths / wall time |
+
+### What `--nbatches` reveals
+
+With the default `n_batches = n_threads = 8`, all strategies look identical: one batch per thread, all running simultaneously. Setting `--nbatches 32` or `--nbatches 64` makes structural differences visible:
+
+| Strategy | What appears |
+|---|---|
+| S3 rayon | Work-stealing: multiple colour segments per thread row, out-of-order completion |
+| S1 naive_spawn | Uses all CPU cores (tokio defaults to `num_cpus`), higher scheduling overhead than S3 |
+| S6 buffered | Hard concurrency cap at 8 — leaves spare cores idle on a 10-core machine |
+| S7 throttled | Wave pattern: thin coloured squares separated by large idle gaps; CPU eff ≈ 10% |
 
 ---
 
@@ -139,6 +210,17 @@ Because the payoff is now a smooth function of S_0 (no barrier-crossing indicato
 │   S1 naive_spawn · S2 JoinSet · S3 rayon_bridge                  │
 │   S4 semaphore · S5 channel_pipeline · S6 stream_buffered        │
 │   S7 stream_throttled                                            │
+│                                                                  │
+│   run_simulation() → ProfiledResult                              │
+│     tracing::info_span!("batch", …) in each closure             │
+│     BatchCollector::global().drain(t0) → Vec<BatchEvent>        │
+└──────────────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  PROFILER BINARY  (src/bin/profiler.rs)                          │
+│   BatchCollectorLayer (tracing subscriber) → Vec<ProfiledResult> │
+│   ratatui TUI: Thread Timelines · Batch Analysis · Convergence  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -212,7 +294,7 @@ Enables cross-crate inlining of the `Propagator::propagate` hot path, which is a
 
 ## Concurrency Strategies
 
-All seven strategies use `MonteCarloEngine::run_batch` as the unit of work. Paths are split into `n_threads` batches.
+All seven strategies use `MonteCarloEngine::run_batch` as the unit of work. Paths are split into `n_batches` independent batches (default: equal to `n_threads`; increase via `--nbatches` to expose work-stealing behaviour in the profiler).
 
 | # | Module | tokio_stream role | CPU model | Key characteristic |
 |---|---|---|---|---|
@@ -289,6 +371,9 @@ src/
 ├── lib.rs
 ├── main.rs                       # Benchmark harness
 │
+├── bin/
+│   └── profiler.rs               # Post-run TUI profiler (ratatui)
+│
 ├── domain/
 │   ├── product.rs                # Product trait — extensibility point
 │   ├── propagator.rs             # Propagator trait + BlackScholes
@@ -308,7 +393,7 @@ src/
 │   └── batch_runner.rs           # BatchConfig, PartialResult
 │
 ├── concurrency/
-│   ├── mod.rs                    # ConcurrencyStrategy enum + dispatch
+│   ├── mod.rs                    # ConcurrencyStrategy enum + run_simulation()
 │   ├── naive_spawn.rs            # S1: anti-pattern
 │   ├── spawn_blocking_joinset.rs # S2: structured tasks
 │   ├── rayon_bridge.rs           # S3: rayon + oneshot + stream
@@ -318,7 +403,9 @@ src/
 │   └── stream_throttled.rs       # S7: throttle + buffer_unordered
 │
 └── analytics/
-    └── results.rs                # PriceResult, BenchmarkReport
+    ├── results.rs                # PriceResult, BenchmarkReport
+    └── profiling.rs              # BatchEvent, ProfiledResult, BatchCollector,
+                                  # BatchCollectorLayer (tracing subscriber)
 ```
 
 ---
@@ -333,7 +420,9 @@ src/
 | `rayon` | Work-stealing thread pool for CPU-bound batches |
 | `statrs` | Normal CDF (Φ) and quantile (Φ⁻¹) for OSS |
 | `rand` | Seeding utilities |
-| `tracing` / `tracing-subscriber` | Structured logging |
+| `tracing` | `info_span!` in each batch closure — structured per-batch instrumentation |
+| `tracing-subscriber` | `BatchCollectorLayer` registry — collects spans into `Vec<BatchEvent>` |
+| `ratatui` + `crossterm` | Terminal UI for the profiler binary |
 | `thiserror` / `anyhow` | Error handling |
 | `criterion` (dev) | Micro-benchmark harness |
 
@@ -374,7 +463,7 @@ let engine = MonteCarloEngine::new(
 );
 ```
 
-The same seven concurrency strategies and the OSS variance-reduction machinery are available to the new instrument without modification.
+The same seven concurrency strategies, the OSS variance-reduction machinery, and the profiler TUI are available to the new instrument without modification.
 
 ---
 

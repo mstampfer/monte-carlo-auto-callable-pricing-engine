@@ -32,7 +32,16 @@ where
             let (tx, rx) = oneshot::channel();
             let eng = Arc::clone(&engine);
             rayon::spawn(move || {
-                let result = eng.run_batch(&cfg);
+                let span = tracing::info_span!("batch",
+                    batch_id = cfg.batch_id as u64,
+                    n_paths  = cfg.n_paths  as u64,
+                    price    = tracing::field::Empty,
+                    std_err  = tracing::field::Empty,
+                );
+                let _guard = span.enter();
+                let result  = eng.run_batch(&cfg);
+                span.record("price",   result.price());
+                span.record("std_err", result.std_err());
                 let _ = tx.send(result);
             });
             rx

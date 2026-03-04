@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::process;
 
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
-
 use hsbc_monte_carlo_auto_callable::{
     analytics::BenchmarkReport,
     concurrency::{run_simulation, ConcurrencyStrategy},
@@ -91,20 +89,6 @@ fn print_usage() {
 
 #[tokio::main]
 async fn main() {
-    // console-subscriber (tokio-console gRPC layer) + fmt layer share a Registry.
-    // tokio-console requires: RUSTFLAGS="--cfg tokio_unstable" at compile time.
-    let console_layer = console_subscriber::ConsoleLayer::builder()
-        .with_default_env()
-        .spawn();
-
-    tracing_subscriber::registry()
-        .with(console_layer)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_filter(EnvFilter::new("warn")),
-        )
-        .init();
-
     // Parse arguments: [--npaths N] [STRATEGY]
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut args = raw.as_slice();
@@ -206,22 +190,25 @@ async fn main() {
 
     for strategy in &selected {
         print!("  Running {:30} ... ", strategy.name());
-        let result = run_simulation(
+        let profiled = run_simulation(
             *strategy,
             Arc::clone(&engine),
             n_paths,
             N_THREADS,
+            N_THREADS,  // n_batches == n_threads for the benchmark binary
             GLOBAL_SEED,
         ).await;
-        println!("{:.0} ms  price = {:.3}", result.wall_time.as_millis(), result.price);
-        report.add(result);
+        println!("{:.0} ms  price = {:.3}",
+            profiled.price_result.wall_time.as_millis(),
+            profiled.price_result.price);
+        report.add(profiled.price_result);
     }
 
     report.print_table();
 
     // ── Greeks via finite difference ─────────────────────────────────────────
-    println!("\n── Delta (finite difference, bump = 1% of S_0) ─────────────────────────");
-    compute_delta(&engine, market_data, n_paths, GLOBAL_SEED).await;
+    // println!("\n── Delta (finite difference, bump = 1% of S_0) ─────────────────────────");
+    // compute_delta(&engine, market_data, n_paths, GLOBAL_SEED).await;
 
     // ── AmericanOption stub — demonstrates plug-in genericity ────────────────
     println!("\n── AmericanOption stub (Bermudan approximation, same engine) ────────────");
@@ -286,6 +273,7 @@ async fn compute_delta(
             Arc::clone(&eng_up),
             n_paths,
             n_threads,
+            n_threads,
             seed,
         ).await;
         let r_dn = run_simulation(
@@ -293,10 +281,11 @@ async fn compute_delta(
             Arc::clone(&eng_dn),
             n_paths,
             n_threads,
+            n_threads,
             seed,   // same seed → common random numbers
         ).await;
 
-        let delta = (r_up.price - r_dn.price) / (2.0 * bump);
+        let delta = (r_up.price_result.price - r_dn.price_result.price) / (2.0 * bump);
         println!("  bump = {:.1}%  →  Δ = {:.4}", bump_frac * 100.0, delta);
     }
 }
@@ -344,16 +333,19 @@ async fn price_american_option(
         BUSINESS_DAYS_PER_MONTH,
     ));
 
-    let result = run_simulation(
+    let profiled = run_simulation(
         ConcurrencyStrategy::RayonBridge,
         engine,
         n_paths,
+        n_threads,
         n_threads,
         seed,
     ).await;
 
     println!(
         "  AmericanOption (Bermudan approx): price = {:.3},  95% CI = [{:.3}, {:.3}]",
-        result.price, result.ci_lower, result.ci_upper,
+        profiled.price_result.price,
+        profiled.price_result.ci_lower,
+        profiled.price_result.ci_upper,
     );
 }

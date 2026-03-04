@@ -1,9 +1,0 @@
-# Bake in tokio_unstable so that console-subscriber and tokio-console
-# instrumentation are always compiled in, regardless of RUSTFLAGS in the shell.
-#
-# Without this, any cargo invocation that uses a cached artifact built
-# WITHOUT the flag will silently produce a binary with no task instrumentation.
-#
-# Reference: https://docs.rs/console-subscriber/latest/console_subscriber/
-[build]
-rustflags = ["--cfg", "tokio_unstable"]

@@ -26,7 +26,19 @@ where
 
     for cfg in configs {
         let eng = Arc::clone(&engine);
-        set.spawn_blocking(move || eng.run_batch(&cfg));
+        set.spawn_blocking(move || {
+            let span = tracing::info_span!("batch",
+                batch_id = cfg.batch_id as u64,
+                n_paths  = cfg.n_paths  as u64,
+                price    = tracing::field::Empty,
+                std_err  = tracing::field::Empty,
+            );
+            let _guard = span.enter();
+            let result  = eng.run_batch(&cfg);
+            span.record("price",   result.price());
+            span.record("std_err", result.std_err());
+            result
+        });
     }
 
     let mut total = PartialResult::default();

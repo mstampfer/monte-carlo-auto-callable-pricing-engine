@@ -15,8 +15,8 @@ use crate::domain::{Product, Propagator};
 use crate::engine::{BatchConfig, MonteCarloEngine, PartialResult};
 
 pub async fn run<P, Pr>(
-    engine:      Arc<MonteCarloEngine<P, Pr>>,
-    configs:     Vec<BatchConfig>,
+    engine:         Arc<MonteCarloEngine<P, Pr>>,
+    configs:        Vec<BatchConfig>,
     max_concurrent: usize,
 ) -> PartialResult
 where
@@ -27,12 +27,21 @@ where
     let mut handles = Vec::with_capacity(configs.len());
 
     for cfg in configs {
-        let eng = Arc::clone(&engine);
+        let eng    = Arc::clone(&engine);
         let permit = Arc::clone(&sem).acquire_owned().await
             .expect("semaphore closed");
 
         handles.push(tokio::task::spawn_blocking(move || {
-            let result = eng.run_batch(&cfg);
+            let span = tracing::info_span!("batch",
+                batch_id = cfg.batch_id as u64,
+                n_paths  = cfg.n_paths  as u64,
+                price    = tracing::field::Empty,
+                std_err  = tracing::field::Empty,
+            );
+            let _guard = span.enter();
+            let result  = eng.run_batch(&cfg);
+            span.record("price",   result.price());
+            span.record("std_err", result.std_err());
             drop(permit); // release slot on completion
             result
         }));

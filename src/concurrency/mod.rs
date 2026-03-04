@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::domain::{Product, Propagator};
 use crate::engine::{BatchConfig, MonteCarloEngine, PartialResult};
-use crate::analytics::PriceResult;
+use crate::analytics::{BatchCollector, PriceResult, ProfiledResult};
 use crate::simulation::BoxMullerRng;
 
 /// Available concurrency strategies for parallel Monte Carlo simulation.
@@ -55,26 +55,31 @@ pub fn make_batch_configs(n_paths: usize, n_batches: usize, global_seed: u64) ->
         .map(|i| {
             let paths = if i < rem { base + 1 } else { base };
             let seed  = BoxMullerRng::batch_seed(global_seed, i as u64);
-            BatchConfig::new(paths, seed)
+            BatchConfig::new(i, paths, seed)
         })
         .collect()
 }
 
 /// Run simulation with the specified strategy.
 ///
-/// Returns a `PriceResult` including wall-clock time.
+/// Per-batch timing and thread identity are captured via `tracing::info_span!` inside
+/// each strategy closure. If a [`crate::analytics::BatchCollectorLayer`] has been
+/// registered as the global tracing subscriber (as the profiler binary does), the
+/// events are collected and returned in `ProfiledResult::events`. Otherwise (e.g. in
+/// the benchmark binary) the drain returns an empty `Vec` at zero cost.
 pub async fn run_simulation<P, Pr>(
     strategy:    ConcurrencyStrategy,
     engine:      Arc<MonteCarloEngine<P, Pr>>,
     n_paths:     usize,
     n_threads:   usize,
+    n_batches:   usize,
     global_seed: u64,
-) -> PriceResult
+) -> ProfiledResult
 where
     P:  Product,
     Pr: Propagator,
 {
-    let batch_configs = make_batch_configs(n_paths, n_threads, global_seed);
+    let batch_configs = make_batch_configs(n_paths, n_batches, global_seed);
     let t0 = Instant::now();
 
     let partial: PartialResult = match strategy {
@@ -95,5 +100,10 @@ where
     };
 
     let elapsed = t0.elapsed();
-    PriceResult::from_partial(strategy.name(), &partial, elapsed)
+    let events  = BatchCollector::global().drain(t0);
+
+    ProfiledResult {
+        price_result: PriceResult::from_partial(strategy.name(), &partial, elapsed),
+        events,
+    }
 }

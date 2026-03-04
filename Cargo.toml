@@ -1,10 +1,11 @@
 [package]
-name    = "hsbc-monte-carlo-auto-callable"
-version = "0.1.0"
-edition = "2021"
+name        = "hsbc-monte-carlo-auto-callable"
+version     = "0.1.0"
+edition     = "2021"
+default-run = "hsbc-monte-carlo-auto-callable"
 
 [dependencies]
-tokio        = { version = "1",    features = ["full", "tracing"] }
+tokio        = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 rayon        = "1"
 futures      = { version = "0.3", default-features = false, features = ["std"] }
@@ -12,9 +13,14 @@ rand         = "0.8"
 statrs       = "0.17"
 thiserror    = "1"
 anyhow       = "1"
-tracing      = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-console-subscriber = "0.5"
+ratatui            = "0.29"
+crossterm          = "0.28"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+
+[[bin]]
+name = "profiler"
+path = "src/bin/profiler.rs"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -24,15 +30,10 @@ opt-level = 3
 lto       = "fat"
 codegen-units = 1
 
-# tokio-console profile: fast enough for realistic timings, but deliberately
-# avoids fat-LTO and single-CGU so that tokio's instrumentation hooks survive
-# the linker.  Use this instead of --release when observing with tokio-console.
+# samply profile: full release optimisations + debug symbols for readable stack frames.
 #
-#   cargo run --profile console -- --npaths 50_000_000 s2
+#   samply record cargo run --profile samply -- --npaths 2_000_000 s3
 #
-[profile.console]
+[profile.samply]
 inherits      = "release"
-opt-level     = 2          # slightly less aggressive — keeps more debug hooks
-lto           = "thin"     # thin LTO still inlines across crates but preserves stubs
-codegen-units = 16         # multiple CGUs → tokio's __tokio_task_id stubs are not elided
-debug         = 1          # line numbers → meaningful stack traces in the TUI
+debug         = 1          # DWARF line numbers → function names in Firefox Profiler
