@@ -27,6 +27,10 @@ pub struct BatchEvent {
     pub price:     f64,
     /// Batch-local standard error.
     pub std_err:   f64,
+    /// Gross bytes allocated (heap) during this batch.
+    pub alloc_bytes: usize,
+    /// Number of heap allocations during this batch.
+    pub alloc_count: usize,
 }
 
 /// Result from `run_simulation` — wraps `PriceResult` plus per-batch profiling data.
@@ -46,6 +50,8 @@ struct InFlightSpan {
     entered_at: Instant,
     price:      f64,
     std_err:    f64,
+    alloc_bytes_at_entry: usize,
+    alloc_count_at_entry: usize,
 }
 
 struct CompletedBatch {
@@ -56,6 +62,8 @@ struct CompletedBatch {
     duration:   Duration,
     price:      f64,
     std_err:    f64,
+    alloc_bytes: usize,
+    alloc_count: usize,
 }
 
 // ── Global collector singleton ────────────────────────────────────────────────
@@ -89,6 +97,8 @@ impl BatchCollector {
                 n_paths:   b.n_paths,
                 price:     b.price,
                 std_err:   b.std_err,
+                alloc_bytes: b.alloc_bytes,
+                alloc_count: b.alloc_count,
             })
             .collect()
     }
@@ -118,6 +128,8 @@ impl<S: tracing::Subscriber> Layer<S> for BatchCollectorLayer {
                 entered_at: Instant::now(),              // overwritten on_enter
                 price:      0.0,
                 std_err:    0.0,
+                alloc_bytes_at_entry: 0,
+                alloc_count_at_entry: 0,
             },
         );
     }
@@ -127,6 +139,9 @@ impl<S: tracing::Subscriber> Layer<S> for BatchCollectorLayer {
         if let Some(s) = BatchCollector::global().in_flight.lock().unwrap().get_mut(id) {
             s.thread_id  = std::thread::current().id();
             s.entered_at = Instant::now();
+            let snap = crate::analytics::alloc_tracker::TrackingAllocator::snapshot();
+            s.alloc_bytes_at_entry = snap.bytes;
+            s.alloc_count_at_entry = snap.count;
         }
     }
 
@@ -144,6 +159,7 @@ impl<S: tracing::Subscriber> Layer<S> for BatchCollectorLayer {
     fn on_exit(&self, id: &span::Id, _ctx: Context<'_, S>) {
         let col = BatchCollector::global();
         if let Some(s) = col.in_flight.lock().unwrap().remove(id) {
+            let snap = crate::analytics::alloc_tracker::TrackingAllocator::snapshot();
             col.completed.lock().unwrap().push(CompletedBatch {
                 batch_id:   s.batch_id,
                 n_paths:    s.n_paths,
@@ -152,6 +168,8 @@ impl<S: tracing::Subscriber> Layer<S> for BatchCollectorLayer {
                 duration:   s.entered_at.elapsed(),
                 price:      s.price,
                 std_err:    s.std_err,
+                alloc_bytes: snap.bytes.wrapping_sub(s.alloc_bytes_at_entry),
+                alloc_count: snap.count.wrapping_sub(s.alloc_count_at_entry),
             });
         }
     }

@@ -11,9 +11,10 @@
 //! Tabs:
 //!   1 / Tab  — Thread Timelines (Gantt)
 //!   2        — Batch Analysis   (histogram, thread matrix, completion order)
-//!   3        — Convergence & Comparison
+//!   3        — Memory Analysis  (per-batch alloc sparklines, peak heap)
+//!   4        — Convergence & Comparison
 //!   q / Esc  — Quit
-//!   ↑ / ↓   — Scroll (Tab 1) or select strategy (Tabs 2/3)
+//!   ↑ / ↓   — Scroll (Tab 1) or select strategy (Tabs 2/3/4)
 
 use std::collections::HashSet;
 use std::io;
@@ -40,11 +41,14 @@ use ratatui::{
 };
 
 use hsbc_monte_carlo_auto_callable::{
-    analytics::{BatchEvent, ProfiledResult},
+    analytics::{BatchEvent, ProfiledResult, TrackingAllocator},
     concurrency::{run_simulation, ConcurrencyStrategy},
     domain::{BlackScholes, DualTimeGrid, MarketData, AutoCallable},
     engine::MonteCarloEngine,
 };
+
+#[global_allocator]
+static ALLOC: TrackingAllocator = TrackingAllocator;
 
 // ── Simulation parameters (identical to main.rs) ─────────────────────────────
 
@@ -88,27 +92,29 @@ const BATCH_COLORS: [Color; 8] = [
 // ── App state ────────────────────────────────────────────────────────────────
 
 struct App {
-    /// Active tab index: 0 = Timeline, 1 = Batch Analysis, 2 = Convergence
+    /// Active tab index: 0 = Timeline, 1 = Batch Analysis, 2 = Memory, 3 = Convergence
     tab: usize,
-    /// Selected strategy index (used by tabs 2 & 3, and for convergence overlay in tab 3)
+    /// Selected strategy index (used by tabs 2–4, and for convergence overlay in tab 3)
     selected: usize,
     /// Scroll offset for Tab 1 Gantt (lines)
     scroll: usize,
     /// All profiling results, one per strategy
     results: Vec<ProfiledResult>,
+    /// Peak heap bytes (live) captured per strategy
+    peak_heap: Vec<usize>,
 }
 
 impl App {
-    fn new(results: Vec<ProfiledResult>) -> Self {
-        Self { tab: 0, selected: 0, scroll: 0, results }
+    fn new(results: Vec<ProfiledResult>, peak_heap: Vec<usize>) -> Self {
+        Self { tab: 0, selected: 0, scroll: 0, results, peak_heap }
     }
 
     fn next_tab(&mut self) {
-        self.tab = (self.tab + 1) % 3;
+        self.tab = (self.tab + 1) % 4;
     }
 
     fn prev_tab(&mut self) {
-        self.tab = (self.tab + 2) % 3;
+        self.tab = (self.tab + 3) % 4;
     }
 
     fn scroll_down(&mut self) {
@@ -172,6 +178,24 @@ fn compute_convergence(result: &ProfiledResult) -> Vec<f64> {
         total_paths += e.n_paths;
         cumsum / total_paths as f64
     }).collect()
+}
+
+/// Compute the shared x-axis range across all strategy results.
+///
+/// Returns `(global_min_ms, global_max_ms)`. The y-axis max and bucket count
+/// are computed inside `render_tab2` once the widget width is known, so that
+/// the sparkline always fills the full width of the histogram pane.
+fn global_histogram_range(results: &[ProfiledResult]) -> (f64, f64) {
+    let mut global_min = f64::MAX;
+    let mut global_max = f64::MIN;
+    for r in results {
+        for e in &r.events {
+            let ms = e.duration.as_secs_f64() * 1000.0;
+            global_min = global_min.min(ms);
+            global_max = global_max.max(ms);
+        }
+    }
+    if global_min > global_max { (0.0, 1.0) } else { (global_min, global_max) }
 }
 
 /// Events sorted by completion time (start + duration).
@@ -257,7 +281,7 @@ fn render_tab1(f: &mut Frame, area: Rect, app: &App) {
 
 // ── Tab 2: Batch Analysis ─────────────────────────────────────────────────────
 
-fn render_tab2(f: &mut Frame, area: Rect, app: &App) {
+fn render_tab2(f: &mut Frame, area: Rect, app: &App, hist_min: f64, hist_max: f64) {
     // Split: left = strategy list, right = details
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -286,92 +310,117 @@ fn render_tab2(f: &mut Frame, area: Rect, app: &App) {
     let result = &app.results[app.selected.min(app.results.len() - 1)];
     let threads = unique_threads(&result.events);
 
+    let n_comp_rows = (result.events.len().div_ceil(20) + 3).min(10) as u16;
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(10),  // histogram
-            Constraint::Length(threads.len() as u16 + 4),  // thread matrix
-            Constraint::Min(3),      // completion order
+            Constraint::Length(threads.len() as u16 + 3),  // thread matrix
+            Constraint::Min(n_comp_rows),                   // completion order
         ])
         .split(chunks[1]);
 
-    // ── Duration histogram ───────────────────────────────────────────────────
-    let durations_ms: Vec<f64> = result.events.iter()
-        .map(|e| e.duration.as_secs_f64() * 1000.0)
-        .collect();
-    let min_ms = durations_ms.iter().cloned().fold(f64::MAX, f64::min);
-    let max_ms = durations_ms.iter().cloned().fold(f64::MIN, f64::max);
+    // ── Duration histogram (shared x/y scale, width-filling) ─────────────────
+    // Use the inner widget width as bucket count: Sparkline renders one bar per
+    // data point, so n_buckets == inner_width guarantees the bars fill the pane.
+    let n_buckets = (right_chunks[0].width as usize).saturating_sub(2).max(8);
+    let range = (hist_max - hist_min).max(0.001);
 
-    // Build histogram with 8 buckets
-    let n_buckets = 8usize;
-    let range = (max_ms - min_ms).max(0.001);
+    // Compute per-strategy peak bucket counts.
+    let peaks: Vec<u64> = app.results.iter().map(|r| {
+        let mut b = vec![0u64; n_buckets];
+        for e in &r.events {
+            let ms = e.duration.as_secs_f64() * 1000.0;
+            let i = ((ms - hist_min) / range * (n_buckets - 1) as f64).round() as usize;
+            b[i.min(n_buckets - 1)] += 1;
+        }
+        b.into_iter().max().unwrap_or(0)
+    }).collect();
+
+    // Y-axis cap: max peak of all strategies *except* the selected one.
+    // If the selected strategy's peak exceeds this cap it is truncated,
+    // preventing an outlier (e.g. S7 throttled) from crushing the scale.
+    let selected_idx = app.selected.min(app.results.len() - 1);
+    let others_y_max: u64 = peaks.iter().enumerate()
+        .filter(|&(i, _)| i != selected_idx)
+        .map(|(_, &p)| p)
+        .max()
+        .unwrap_or(1);
+    let selected_peak = peaks[selected_idx];
+    let truncated = selected_peak > others_y_max && app.results.len() > 1;
+    let hist_y_max = if truncated { others_y_max } else { selected_peak.max(1) };
+
     let mut buckets = vec![0u64; n_buckets];
-    for &d in &durations_ms {
-        let bucket = ((d - min_ms) / range * (n_buckets - 1) as f64).round() as usize;
-        buckets[bucket.min(n_buckets - 1)] += 1;
+    for e in &result.events {
+        let ms = e.duration.as_secs_f64() * 1000.0;
+        let i = ((ms - hist_min) / range * (n_buckets - 1) as f64).round() as usize;
+        buckets[i.min(n_buckets - 1)] += 1;
     }
 
+    let trunc_note = if truncated { " (y truncated)" } else { "" };
     let sparkline = Sparkline::default()
         .block(Block::default().borders(Borders::ALL).title(
-            format!(" Duration histogram  [{:.1}ms – {:.1}ms] ", min_ms, max_ms)
+            format!(" Duration histogram  [{:.1}ms – {:.1}ms]{} ", hist_min, hist_max, trunc_note)
         ))
         .data(&buckets)
+        .max(hist_y_max)
         .style(Style::default().fg(Color::Green));
     f.render_widget(sparkline, right_chunks[0]);
 
-    // ── Batch-to-thread matrix ────────────────────────────────────────────────
-    let n_batches = result.events.len();
-    let col_w = 3usize;
-    let mut header_cells: Vec<Cell> = vec![Cell::from("Thread")];
-    for b in 0..n_batches {
-        header_cells.push(Cell::from(format!("{:>2}", b)).style(
-            Style::default().fg(BATCH_COLORS[b % BATCH_COLORS.len()])
-        ));
-    }
-
-    let mut rows: Vec<Row> = Vec::new();
-    rows.push(Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD)));
-
+    // ── Batch-to-thread mapping (compact list) ────────────────────────────────
+    // A sparse matrix with one column per batch requires ~200 chars for 64 batches;
+    // ratatui scales columns proportionally when they overflow, shrinking cells to
+    // 1 char and making the ● dots invisible. Instead, list each thread's batches.
+    let mut matrix_lines: Vec<Line<'static>> = Vec::new();
+    matrix_lines.push(Line::from(Span::styled(
+        "Thread  Batches run (sorted by start time, colored by batch id)",
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
     for (tid_idx, tid) in threads.iter().enumerate() {
-        let mut cells: Vec<Cell> = vec![Cell::from(format!("T{}", tid_idx))];
-        for b in 0..n_batches {
-            // Find event for batch b on this thread
-            let ran = result.events.iter().any(|e| e.batch_id == b && &e.thread_id == tid);
-            cells.push(Cell::from(if ran { " ●" } else { "  " }).style(
-                if ran {
-                    Style::default().fg(BATCH_COLORS[b % BATCH_COLORS.len()])
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                }
+        let mut batch_events: Vec<(usize, std::time::Duration)> = result.events.iter()
+            .filter(|e| &e.thread_id == tid)
+            .map(|e| (e.batch_id, e.start))
+            .collect();
+        batch_events.sort_by_key(|&(_, s)| s);
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(format!("T{:<5} ", tid_idx), Style::default().fg(Color::Gray)),
+        ];
+        for (bid, _) in &batch_events {
+            spans.push(Span::styled(
+                format!(" {:>3}", bid),
+                Style::default().fg(BATCH_COLORS[bid % BATCH_COLORS.len()]),
             ));
         }
-        rows.push(Row::new(cells));
+        matrix_lines.push(Line::from(spans));
     }
+    let matrix_para = Paragraph::new(matrix_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Batch-to-thread mapping "));
+    f.render_widget(matrix_para, right_chunks[1]);
 
-    let mut widths: Vec<Constraint> = vec![Constraint::Length(6)];
-    for _ in 0..n_batches {
-        widths.push(Constraint::Length(col_w as u16));
-    }
-
-    let matrix = Table::new(rows, &widths)
-        .block(Block::default().borders(Borders::ALL).title(" Batch-to-thread matrix "));
-    f.render_widget(matrix, right_chunks[1]);
-
-    // ── Completion order ──────────────────────────────────────────────────────
+    // ── Completion order (wrapped) ────────────────────────────────────────────
     let order = completion_order(&result.events);
-    let order_str: Vec<String> = order.iter().map(|id| id.to_string()).collect();
-    let completion_para = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Completion order: ", Style::default().fg(Color::White)),
-            Span::styled(order_str.join("  "), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "(out-of-order = work-stealing / async scheduling visible)",
-                Style::default().fg(Color::DarkGray),
-            )
-        ]),
-    ]).block(Block::default().borders(Borders::ALL).title(" Completion Order "));
+    let n_per_line = 20usize;
+    let mut comp_lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            "Completion order (by finish time):",
+            Style::default().fg(Color::White),
+        )),
+    ];
+    for chunk in order.chunks(n_per_line) {
+        let spans: Vec<Span<'static>> = std::iter::once(Span::raw("  "))
+            .chain(chunk.iter().map(|&id| Span::styled(
+                format!("{:>3}", id),
+                Style::default().fg(BATCH_COLORS[id % BATCH_COLORS.len()]),
+            )))
+            .collect();
+        comp_lines.push(Line::from(spans));
+    }
+    comp_lines.push(Line::from(Span::styled(
+        "  (out-of-order = work-stealing / async scheduling visible)",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let completion_para = Paragraph::new(comp_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Completion Order "));
     f.render_widget(completion_para, right_chunks[2]);
 }
 
@@ -392,9 +441,19 @@ fn render_tab3(f: &mut Frame, area: Rect, app: &App) {
             let min_p = conv.iter().cloned().fold(f64::MAX, f64::min);
             let max_p = conv.iter().cloned().fold(f64::MIN, f64::max);
             let range = (max_p - min_p).max(0.001);
-            let spark_data: Vec<u64> = conv.iter()
-                .map(|&p| ((p - min_p) / range * 1000.0) as u64)
-                .collect();
+
+            // Interpolate convergence curve to fill the widget width.
+            let inner_w = (chunks[0].width as usize).saturating_sub(2).max(1);
+            let spark_data: Vec<u64> = (0..inner_w).map(|col| {
+                // Map column to a fractional index into conv[]
+                let t = col as f64 / (inner_w - 1).max(1) as f64;
+                let idx_f = t * (conv.len() - 1) as f64;
+                let lo = (idx_f.floor() as usize).min(conv.len() - 1);
+                let hi = (lo + 1).min(conv.len() - 1);
+                let frac = idx_f - lo as f64;
+                let p = conv[lo] * (1.0 - frac) + conv[hi] * frac;
+                ((p - min_p) / range * 1000.0) as u64
+            }).collect();
 
             let final_price = conv.last().copied().unwrap_or(0.0);
             let sparkline = Sparkline::default()
@@ -420,12 +479,16 @@ fn render_tab3(f: &mut Frame, area: Rect, app: &App) {
         Cell::from("CPU eff").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Imbalance").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Speedup").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Alloc").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Peak heap").style(Style::default().add_modifier(Modifier::BOLD)),
     ]).style(Style::default().fg(Color::Yellow));
 
     let rows: Vec<Row> = app.results.iter().enumerate().map(|(i, r)| {
         let ms = r.price_result.wall_time.as_millis();
         let speedup = baseline_ms / ms as f64;
         let (cpu_eff, imbalance) = compute_metrics(r);
+        let total_alloc: usize = r.events.iter().map(|e| e.alloc_bytes).sum();
+        let peak = app.peak_heap.get(i).copied().unwrap_or(0);
 
         let style = if i == app.selected {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -444,6 +507,8 @@ fn render_tab3(f: &mut Frame, area: Rect, app: &App) {
             Cell::from(format!("{:.0}%", cpu_eff * 100.0)),
             Cell::from(format!("{:.2}", imbalance)),
             Cell::from(format!("{:.2}×", speedup)),
+            Cell::from(format_bytes(total_alloc)),
+            Cell::from(format_bytes(peak)),
         ]).style(style)
     }).collect();
 
@@ -454,6 +519,8 @@ fn render_tab3(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(8),
         Constraint::Length(10),
         Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(10),
     ];
 
     let table = Table::new(rows, widths)
@@ -463,6 +530,173 @@ fn render_tab3(f: &mut Frame, area: Rect, app: &App) {
         ))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_widget(table, chunks[1]);
+}
+
+// ── Tab 4: Memory Analysis ────────────────────────────────────────────────
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Linearly interpolate a sparse data series to exactly `width` points,
+/// so the sparkline fills the full widget width (one bar per column).
+fn interpolate_to_width(data: &[u64], width: usize) -> Vec<u64> {
+    if data.is_empty() {
+        return vec![0; width];
+    }
+    if data.len() == 1 {
+        return vec![data[0]; width];
+    }
+    (0..width).map(|col| {
+        let t = col as f64 / (width - 1).max(1) as f64;
+        let idx_f = t * (data.len() - 1) as f64;
+        let lo = (idx_f.floor() as usize).min(data.len() - 1);
+        let hi = (lo + 1).min(data.len() - 1);
+        let frac = idx_f - lo as f64;
+        let v = data[lo] as f64 * (1.0 - frac) + data[hi] as f64 * frac;
+        v as u64
+    }).collect()
+}
+
+fn render_tab4(f: &mut Frame, area: Rect, app: &App) {
+    if app.results.is_empty() {
+        return;
+    }
+    let selected_idx = app.selected.min(app.results.len() - 1);
+    let result = &app.results[selected_idx];
+
+    // Vertical layout: full-width sparklines on top, strategy list + summary at bottom
+    let n_strat_rows = (app.results.len() as u16 + 2).min(12);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(12),           // alloc bytes sparkline
+            Constraint::Length(12),           // alloc count sparkline
+            Constraint::Min(n_strat_rows),    // bottom pane
+        ])
+        .split(area);
+
+    // ── Alloc bytes sparkline (interpolated to full width, global y-scale) ─
+    let global_max_bytes: u64 = app.results.iter()
+        .flat_map(|r| r.events.iter().map(|e| e.alloc_bytes as u64))
+        .max()
+        .unwrap_or(1);
+
+    let raw_bytes: Vec<u64> = result.events.iter()
+        .map(|e| e.alloc_bytes as u64)
+        .collect();
+
+    let inner_w = (rows[0].width as usize).saturating_sub(2).max(1);
+    let bytes_data = interpolate_to_width(&raw_bytes, inner_w);
+
+    let max_batch_bytes = raw_bytes.iter().copied().max().unwrap_or(0);
+    let sparkline_bytes = Sparkline::default()
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Allocation volume per batch — {}  [max: {}] ",
+            result.price_result.strategy_name.trim(),
+            format_bytes(max_batch_bytes as usize)
+        )))
+        .data(&bytes_data)
+        .max(global_max_bytes)
+        .style(Style::default().fg(Color::Magenta));
+    f.render_widget(sparkline_bytes, rows[0]);
+
+    // ── Alloc count sparkline (interpolated to full width, global y-scale) ─
+    let global_max_count: u64 = app.results.iter()
+        .flat_map(|r| r.events.iter().map(|e| e.alloc_count as u64))
+        .max()
+        .unwrap_or(1);
+
+    let raw_count: Vec<u64> = result.events.iter()
+        .map(|e| e.alloc_count as u64)
+        .collect();
+
+    let inner_w = (rows[1].width as usize).saturating_sub(2).max(1);
+    let count_data = interpolate_to_width(&raw_count, inner_w);
+
+    let max_batch_count = raw_count.iter().copied().max().unwrap_or(0);
+    let sparkline_count = Sparkline::default()
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Allocation count per batch — {}  [max: {}] ",
+            result.price_result.strategy_name.trim(),
+            max_batch_count
+        )))
+        .data(&count_data)
+        .max(global_max_count)
+        .style(Style::default().fg(Color::Cyan));
+    f.render_widget(sparkline_count, rows[1]);
+
+    // ── Bottom: strategy list (left) + memory summary (right) ────────────────
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(38), Constraint::Min(0)])
+        .split(rows[2]);
+
+    // Strategy list
+    let items: Vec<ListItem> = app.results.iter().enumerate().map(|(i, r)| {
+        let prefix = if i == app.selected { "● " } else { "  " };
+        let total_alloc: usize = r.events.iter().map(|e| e.alloc_bytes).sum();
+        ListItem::new(format!("{}{} ({})", prefix, r.price_result.strategy_name.trim(), format_bytes(total_alloc)))
+    }).collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Strategy [↑↓] "))
+        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.selected));
+    f.render_stateful_widget(list, bottom[0], &mut list_state);
+
+    // Memory summary
+    let total_alloc_bytes: usize = result.events.iter().map(|e| e.alloc_bytes).sum();
+    let total_alloc_count: usize = result.events.iter().map(|e| e.alloc_count).sum();
+    let n_batches = result.events.len().max(1);
+    let avg_bytes = total_alloc_bytes / n_batches;
+    let avg_count = total_alloc_count / n_batches;
+    let peak = app.peak_heap.get(selected_idx).copied().unwrap_or(0);
+
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::styled("  Total alloc bytes:  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>14}  ({} avg/batch)", format_bytes(total_alloc_bytes), format_bytes(avg_bytes)),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Total alloc count:  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>14}  ({} avg/batch)", total_alloc_count, avg_count),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Peak heap (live):   ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>14}", format_bytes(peak)),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Batches:            ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>14}", result.events.len()),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+
+    let summary = Paragraph::new(summary_lines)
+        .block(Block::default().borders(Borders::ALL).title(" Memory Summary "));
+    f.render_widget(summary, bottom[1]);
 }
 
 // ── Main render ───────────────────────────────────────────────────────────────
@@ -484,7 +718,8 @@ fn ui(f: &mut Frame, app: &App) {
     let tab_titles: Vec<Line> = vec![
         Line::from(" 1: Thread Timelines "),
         Line::from(" 2: Batch Analysis "),
-        Line::from(" 3: Convergence & Compare "),
+        Line::from(" 3: Memory Analysis "),
+        Line::from(" 4: Convergence & Compare "),
     ];
     let tabs = Tabs::new(tab_titles)
         .block(Block::default().borders(Borders::ALL).title(" Monte Carlo Profiler "))
@@ -496,14 +731,18 @@ fn ui(f: &mut Frame, app: &App) {
     // Content
     match app.tab {
         0 => render_tab1(f, chunks[1], app),
-        1 => render_tab2(f, chunks[1], app),
-        2 => render_tab3(f, chunks[1], app),
+        1 => {
+            let (h_min, h_max) = global_histogram_range(&app.results);
+            render_tab2(f, chunks[1], app, h_min, h_max);
+        }
+        2 => render_tab4(f, chunks[1], app),
+        3 => render_tab3(f, chunks[1], app),
         _ => {}
     }
 
     // Help bar
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(" Tab/1/2/3 ", Style::default().fg(Color::Cyan)),
+        Span::styled(" Tab/1/2/3/4 ", Style::default().fg(Color::Cyan)),
         Span::raw("switch  "),
         Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)),
         Span::raw("scroll/select  "),
@@ -624,13 +863,17 @@ async fn main() -> anyhow::Result<()> {
     let t_total = Instant::now();
 
     let mut results: Vec<ProfiledResult> = Vec::new();
+    let mut peak_heap: Vec<usize> = Vec::new();
     for strategy in &selected_strategies {
         eprint!("  {:35} ... ", strategy.name());
+        TrackingAllocator::reset_peak();
         let profiled = run_simulation(*strategy, Arc::clone(&engine), n_paths, N_THREADS, n_batches, GLOBAL_SEED).await;
+        let peak = TrackingAllocator::peak_bytes();
         eprintln!("{} ms  price = {:.3}",
             profiled.price_result.wall_time.as_millis(),
             profiled.price_result.price);
         results.push(profiled);
+        peak_heap.push(peak);
     }
 
     eprintln!("Total run time: {} ms\n", t_total.elapsed().as_millis());
@@ -644,7 +887,7 @@ async fn main() -> anyhow::Result<()> {
     let backend  = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(results);
+    let mut app = App::new(results, peak_heap);
 
     // ── Event loop ────────────────────────────────────────────────────────────
     loop {
@@ -662,6 +905,7 @@ async fn main() -> anyhow::Result<()> {
                     KeyCode::Char('1')                => app.tab = 0,
                     KeyCode::Char('2')                => app.tab = 1,
                     KeyCode::Char('3')                => app.tab = 2,
+                    KeyCode::Char('4')                => app.tab = 3,
                     KeyCode::Down                     => app.scroll_down(),
                     KeyCode::Up                       => app.scroll_up(),
                     _ => {}

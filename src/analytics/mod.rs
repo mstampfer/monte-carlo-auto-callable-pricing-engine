@@ -1,5 +1,7 @@
+pub mod alloc_tracker;
 pub mod results;
 pub mod profiling;
 
+pub use alloc_tracker::TrackingAllocator;
 pub use results::{PriceResult, BenchmarkReport};
 pub use profiling::{BatchCollector, BatchCollectorLayer, BatchEvent, ProfiledResult};
