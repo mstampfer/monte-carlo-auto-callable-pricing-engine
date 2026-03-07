@@ -36,6 +36,7 @@ const ALL_STRATEGIES: &[ConcurrencyStrategy] = &[
     ConcurrencyStrategy::ChannelPipeline,
     ConcurrencyStrategy::StreamBuffered,
     ConcurrencyStrategy::StreamThrottled,
+    ConcurrencyStrategy::StdThread,
 ];
 
 fn parse_npaths(s: &str) -> Result<usize, String> {
@@ -61,6 +62,7 @@ fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
         "5" | "channel_pipeline"        => Some(ConcurrencyStrategy::ChannelPipeline),
         "6" | "stream_buffered"         => Some(ConcurrencyStrategy::StreamBuffered),
         "7" | "stream_throttled"        => Some(ConcurrencyStrategy::StreamThrottled),
+        "8" | "std_thread"             => Some(ConcurrencyStrategy::StdThread),
         _ => None,
     }
 }
@@ -80,6 +82,7 @@ fn print_usage() {
     eprintln!("    s5  channel_pipeline");
     eprintln!("    s6  stream_buffered");
     eprintln!("    s7  stream_throttled");
+    eprintln!("    s8  std_thread");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  cargo run --release                             # all, 200_000 paths");

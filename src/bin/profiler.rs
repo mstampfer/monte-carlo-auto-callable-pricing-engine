@@ -1,12 +1,14 @@
 //! Monte Carlo Profiler TUI
 //!
-//! Post-run visualiser for all 7 concurrency strategies.
+//! Post-run visualiser for all 8 concurrency strategies.
 //!
 //! Usage:
 //!   cargo run --release --bin profiler
 //!   cargo run --release --bin profiler -- --npaths 2_000_000
 //!   cargo run --release --bin profiler -- --nbatches 64
 //!   cargo run --release --bin profiler -- s3 s6 s7
+//!   cargo run --release --bin profiler -- --export-timelines presentation/timelines
+//!   cargo run --release --bin profiler -- --export-timelines presentation/timelines s3 s8
 //!
 //! Tabs:
 //!   1 / Tab  — Thread Timelines (Gantt)
@@ -16,11 +18,9 @@
 //!   q / Esc  — Quit
 //!   ↑ / ↓   — Scroll (Tab 1) or select strategy (Tabs 2/3/4)
 
-use std::collections::HashSet;
 use std::io;
 use std::process;
 use std::sync::Arc;
-use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -41,7 +41,8 @@ use ratatui::{
 };
 
 use hsbc_monte_carlo_auto_callable::{
-    analytics::{BatchEvent, ProfiledResult, TrackingAllocator},
+    analytics::{BatchEvent, ProfiledResult, TrackingAllocator,
+                unique_threads, compute_metrics, svg_timeline},
     concurrency::{run_simulation, ConcurrencyStrategy},
     domain::{BlackScholes, DualTimeGrid, MarketData, AutoCallable},
     engine::MonteCarloEngine,
@@ -75,6 +76,7 @@ const ALL_STRATEGIES: &[ConcurrencyStrategy] = &[
     ConcurrencyStrategy::ChannelPipeline,
     ConcurrencyStrategy::StreamBuffered,
     ConcurrencyStrategy::StreamThrottled,
+    ConcurrencyStrategy::StdThread,
 ];
 
 /// Colors cycled per batch_id in the Gantt chart.
@@ -134,37 +136,7 @@ impl App {
 
 // ── Metric helpers ────────────────────────────────────────────────────────────
 
-fn unique_threads(events: &[BatchEvent]) -> Vec<ThreadId> {
-    let mut seen: HashSet<ThreadId> = HashSet::new();
-    let mut ordered: Vec<ThreadId>  = Vec::new();
-    // Sort by first appearance (start time) to get stable T0, T1, ... labels
-    let mut sorted: Vec<&BatchEvent> = events.iter().collect();
-    sorted.sort_by_key(|e| e.start);
-    for e in sorted {
-        if seen.insert(e.thread_id) {
-            ordered.push(e.thread_id);
-        }
-    }
-    ordered
-}
-
-/// Returns (cpu_efficiency 0–1, load_imbalance_index).
-fn compute_metrics(result: &ProfiledResult) -> (f64, f64) {
-    let wall_ns = result.price_result.wall_time.as_nanos() as f64;
-    if wall_ns == 0.0 || result.events.is_empty() {
-        return (0.0, 1.0);
-    }
-    let n_threads = unique_threads(&result.events).len() as f64;
-    let total_compute: f64 = result.events.iter().map(|e| e.duration.as_nanos() as f64).sum();
-    let cpu_eff = total_compute / (wall_ns * n_threads);
-
-    let durations_ms: Vec<f64> = result.events.iter().map(|e| e.duration.as_secs_f64() * 1000.0).collect();
-    let max_dur  = durations_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mean_dur = durations_ms.iter().sum::<f64>() / durations_ms.len() as f64;
-    let imbalance = if mean_dur > 0.0 { max_dur / mean_dur } else { 1.0 };
-
-    (cpu_eff, imbalance)
-}
+// unique_threads() and compute_metrics() imported from analytics crate.
 
 /// Running price convergence: cumulative price after each batch (sorted by completion).
 fn compute_convergence(result: &ProfiledResult) -> Vec<f64> {
@@ -770,6 +742,7 @@ fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
         "5" | "channel_pipeline"       => Some(ConcurrencyStrategy::ChannelPipeline),
         "6" | "stream_buffered"        => Some(ConcurrencyStrategy::StreamBuffered),
         "7" | "stream_throttled"       => Some(ConcurrencyStrategy::StreamThrottled),
+        "8" | "std_thread"            => Some(ConcurrencyStrategy::StdThread),
         _ => None,
     }
 }
@@ -815,6 +788,22 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         DEFAULT_N_BATCHES
+    };
+
+    let export_dir: Option<String> = if args.first().map(|s| s == "--export-timelines").unwrap_or(false) {
+        let dir = match args.get(1) {
+            Some(val) if parse_strategy(val).is_none() && !val.starts_with('-') => {
+                args = &args[2..];
+                val.clone()
+            }
+            _ => {
+                args = &args[1..];
+                "timelines".to_string()
+            }
+        };
+        Some(dir)
+    } else {
+        None
     };
 
     let selected_strategies: Vec<ConcurrencyStrategy> = if args.is_empty() {
@@ -877,6 +866,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     eprintln!("Total run time: {} ms\n", t_total.elapsed().as_millis());
+
+    // ── SVG export (if requested) ────────────────────────────────────────────
+    if let Some(ref dir) = export_dir {
+        let dir = std::path::Path::new(dir);
+        match svg_timeline::export_all(&results, dir) {
+            Ok(paths) => {
+                eprintln!("Exported {} SVG timeline(s) to {}/", paths.len(), dir.display());
+                for p in &paths {
+                    eprintln!("  {}", p.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("error: failed to export SVGs: {e}");
+                process::exit(1);
+            }
+        }
+    }
+
     eprintln!("Starting TUI — press q or Esc to quit...");
     std::thread::sleep(Duration::from_millis(300)); // let user read the output
 

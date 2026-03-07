@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -209,4 +209,38 @@ impl tracing::field::Visit for RecordVisitor {
         }
     }
     fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+// ── Shared analysis helpers ─────────────────────────────────────────────────
+
+/// Unique thread IDs ordered by first appearance (start time).
+pub fn unique_threads(events: &[BatchEvent]) -> Vec<ThreadId> {
+    let mut seen: HashSet<ThreadId> = HashSet::new();
+    let mut ordered: Vec<ThreadId>  = Vec::new();
+    let mut sorted: Vec<&BatchEvent> = events.iter().collect();
+    sorted.sort_by_key(|e| e.start);
+    for e in sorted {
+        if seen.insert(e.thread_id) {
+            ordered.push(e.thread_id);
+        }
+    }
+    ordered
+}
+
+/// Returns (cpu_efficiency 0–1, load_imbalance_index).
+pub fn compute_metrics(result: &ProfiledResult) -> (f64, f64) {
+    let wall_ns = result.price_result.wall_time.as_nanos() as f64;
+    if wall_ns == 0.0 || result.events.is_empty() {
+        return (0.0, 1.0);
+    }
+    let n_threads = unique_threads(&result.events).len() as f64;
+    let total_compute: f64 = result.events.iter().map(|e| e.duration.as_nanos() as f64).sum();
+    let cpu_eff = total_compute / (wall_ns * n_threads);
+
+    let durations_ms: Vec<f64> = result.events.iter().map(|e| e.duration.as_secs_f64() * 1000.0).collect();
+    let max_dur  = durations_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mean_dur = durations_ms.iter().sum::<f64>() / durations_ms.len() as f64;
+    let imbalance = if mean_dur > 0.0 { max_dur / mean_dur } else { 1.0 };
+
+    (cpu_eff, imbalance)
 }

@@ -5,6 +5,7 @@ pub mod semaphore_bounded;
 pub mod channel_pipeline;
 pub mod stream_buffered;
 pub mod stream_throttled;
+pub mod std_thread;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +32,8 @@ pub enum ConcurrencyStrategy {
     StreamBuffered,
     /// S7: throttle + buffer_unordered (cloud rate-limiting scenario)
     StreamThrottled,
+    /// S8: std::thread::scope (pure OS threads, no async runtime)
+    StdThread,
 }
 
 impl ConcurrencyStrategy {
@@ -43,6 +46,7 @@ impl ConcurrencyStrategy {
             Self::ChannelPipeline       => "S5  channel_pipeline(8)",
             Self::StreamBuffered        => "S6  stream_buffered(8)",
             Self::StreamThrottled       => "S7  stream_throttled(8,10ms)",
+            Self::StdThread            => "S8  std_thread(8)",
         }
     }
 }
@@ -97,6 +101,8 @@ where
             stream_buffered::run(Arc::clone(&engine), batch_configs, n_threads).await,
         ConcurrencyStrategy::StreamThrottled =>
             stream_throttled::run(Arc::clone(&engine), batch_configs, n_threads).await,
+        ConcurrencyStrategy::StdThread =>
+            std_thread::run(Arc::clone(&engine), batch_configs, n_threads).await,
     };
 
     let elapsed = t0.elapsed();

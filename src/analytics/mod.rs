@@ -4,4 +4,7 @@ pub mod profiling;
 
 pub use alloc_tracker::TrackingAllocator;
 pub use results::{PriceResult, BenchmarkReport};
-pub use profiling::{BatchCollector, BatchCollectorLayer, BatchEvent, ProfiledResult};
+pub mod svg_timeline;
+
+pub use profiling::{BatchCollector, BatchCollectorLayer, BatchEvent, ProfiledResult,
+                    unique_threads, compute_metrics};
