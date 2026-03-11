@@ -61,7 +61,7 @@ All eight strategies converge to the same price within each other's 95% confiden
 
 ## Profiler TUI
 
-The `profiler` binary runs the same simulation and renders a post-run ratatui TUI that reveals *how* each strategy used its threads. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing and thread identity with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation).
+The `profiler` binary runs the same simulation and renders a post-run [ratatui](https://ratatui.rs/) TUI that reveals *how* each strategy uses its threads, memory, and convergence behaviour. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing, thread identity, and allocation metrics with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation). A `TrackingAllocator` wrapping the global allocator records per-batch heap bytes and allocation counts.
 
 ```bash
 # Default: all 8 strategies, 200K paths, 32 batches (4× threads — exposes work-stealing)
@@ -72,34 +72,56 @@ cargo run --release --bin profiler -- --npaths 2_000_000
 
 # More batches to make strategy differences visible
 cargo run --release --bin profiler -- --nbatches 64 s1 s3 s6 s7
+
+# Export SVG timelines to a directory
+cargo run --release --bin profiler -- --export-timelines presentation/svg/timelines
 ```
 
-### Tab 1 — Thread Timelines
+### Tab 1 — Thread Timelines (Gantt)
 
-Gantt chart for each strategy. Each row is one OS thread; each coloured block is one batch (colour = `batch_id`). Grey `░` = idle.
+Gantt chart for each strategy. Each row is one OS thread; each coloured block is one batch (colour cycles through 8 colours by `batch_id`). Grey `░` = idle time. The footer shows CPU efficiency, load imbalance ratio, batch count, and final price. Dense packing = high parallelism; gaps reveal scheduling overhead or throttling.
 
-```
-▶ S3  rayon_bridge   111 ms
-  T0 [████████░░░████████████░░░░░████████████████░░░]
-  T1 [░░████████████████░░░░████████████████████████░]
-  ...
-  CPU eff: 95%  Imbalance: 1.95  Batches: 64  Price: 96.740
-```
-
-Keys: `↑`/`↓` scroll, `Tab`/`1`/`2`/`3` switch tabs, `q`/`Esc` quit.
+![Thread Timelines](presentation/svg/images/thread_timelines.png)
 
 ### Tab 2 — Batch Analysis
 
-For a selected strategy (chosen with `↑`/`↓`):
+Left pane lists all strategies with wall-clock times; `↑`/`↓` selects the strategy shown in the right pane. The right pane has three sections:
 
-- **Duration histogram** — sparkline of batch compute-time distribution
-- **Batch-to-thread matrix** — which thread ran which batch (`●`)
-- **Completion order** — batch IDs sorted by finish time; out-of-order = work-stealing or async scheduling visible
+- **Duration histogram** — sparkline of batch compute-time distribution. Shared x-axis across strategies; y-axis auto-scaled with outlier truncation (prevents S7's 80 ms throttle delay from crushing scale).
+- **Batch-to-thread mapping** — compact per-thread list of executed batch IDs sorted by start time. Reveals work-stealing (multiple batches per thread) vs static assignment.
+- **Completion order** — batch IDs listed in finish-time order (wrapped, 20 per line). Out-of-order IDs indicate work-stealing or async task reordering.
 
-### Tab 3 — Convergence & Comparison
+![Batch Analysis](presentation/svg/images/batch_analysis.png)
 
-- **Price convergence sparkline** — running price after each batch completion
-- **Strategy comparison table** — wall time, price, CPU efficiency %, load imbalance index, speedup vs S1
+### Tab 3 — Memory Analysis
+
+Two full-width sparklines at the top show **allocation volume** (bytes) and **allocation count** per batch for the selected strategy, with a global y-scale across all strategies for visual consistency.
+
+Below, the strategy selector (left) and a memory summary (right) display:
+
+- **Total alloc bytes** — gross heap allocated during the run, with per-batch average
+- **Total alloc count** — number of heap allocations, with per-batch average
+- **Peak heap** — maximum live bytes on the heap (from `TrackingAllocator::peak_bytes()`)
+
+This tab makes memory profiles directly comparable — S7's flat 81 KB vs S2's 4.1 MB burst is immediately visible.
+
+![Memory Analysis](presentation/svg/images/memory_analysis.png)
+
+### Tab 4 — Convergence & Comparison
+
+- **Price convergence sparkline** — cumulative running price weighted by batch `n_paths`, sorted by completion time. Shows how quickly each strategy converges to the final answer. Tight early convergence (S5) means the first partial price streamed to a UI is already close to final.
+- **Strategy comparison table** — columns: wall time (ms), final price, CPU efficiency (%), load imbalance ratio, speedup vs baseline, total allocation bytes, peak heap. Rows colour-coded: green = CPU eff ≥ 95%, red = CPU eff < 70%.
+
+![Convergence & Comparison](presentation/svg/images/convergence.png)
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Next / previous tab |
+| `1` `2` `3` `4` | Jump to tab directly |
+| `↑` / `↓` | Scroll (Tab 1) or select strategy (Tabs 2–4) |
+| `q` / `Esc` | Quit |
 
 ### Key metrics
 
