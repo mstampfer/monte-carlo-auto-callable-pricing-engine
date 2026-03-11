@@ -507,27 +507,6 @@ Design rationale: [`presentation/notes/slide24_aws_hybrid_architecture.md`](pres
 
 ---
 
-## Presentation
-
-A 25-slide deck with speaker notes covers the full study:
-
-```
-presentation/
-├── concurrency_optimization.pptx    # Main deck (25 slides)
-├── svg/images/                      # Architecture diagrams (SVG)
-│   ├── architecture_overview.svg
-│   ├── hybrid_architecture.svg
-│   └── aws_hybrid_architecture.svg
-└── notes/                           # Speaker notes (md + pdf)
-    ├── strategies.md                # All 8 strategies — code + analysis
-    ├── strategy_recommendations.md  # Use-case matrix + decision tree
-    ├── slide24_aws_hybrid_architecture.md
-    ├── slide05–slide22_*.md         # Per-slide deep-dive notes
-    └── *.pdf                        # PDF exports of all notes
-```
-
----
-
 ## References
 
 - P. Glasserman & J. Staum, *Conditioning on one-step survival for barrier option simulations*, Operations Research 49(6), 2001.
