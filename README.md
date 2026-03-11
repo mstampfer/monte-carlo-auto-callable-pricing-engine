@@ -185,44 +185,7 @@ Because the payoff is now a smooth function of S_0 (no barrier-crossing indicato
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  DOMAIN  (pure value types, no allocation in hot path)           │
-│                                                                  │
-│   Product (trait)        Propagator (trait)    DualTimeGrid      │
-│   └─ AutoCallable        └─ BlackScholes        MarketData       │
-│   └─ AmericanOption stub                                         │
-└──────────────────────────────────────────────────────────────────┘
-                  │                   │
-                  ▼                   ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  ENGINE                                                          │
-│   MonteCarloEngine<P: Product, Pr: Propagator>                   │
-│   └─ run_batch(&BatchConfig) -> PartialResult  (synchronous)     │
-│       ├─ OSS step at each monthly boundary                       │
-│       ├─ Brownian bridge for daily sub-steps                     │
-│       └─ Knock-in monitoring on every daily spot                 │
-└──────────────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  CONCURRENCY LAYER  (8 strategies, same engine unit of work)     │
-│   S1 naive_spawn · S2 JoinSet · S3 rayon_bridge                  │
-│   S4 semaphore · S5 channel_pipeline · S6 stream_buffered        │
-│   S7 stream_throttled · S8 std_thread                            │
-│                                                                  │
-│   run_simulation() → ProfiledResult                              │
-│     tracing::info_span!("batch", …) in each closure             │
-│     BatchCollector::global().drain(t0) → Vec<BatchEvent>        │
-└──────────────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  PROFILER BINARY  (src/bin/profiler.rs)                          │
-│   BatchCollectorLayer (tracing subscriber) → Vec<ProfiledResult> │
-│   ratatui TUI: Thread Timelines · Batch Analysis · Convergence  │
-└──────────────────────────────────────────────────────────────────┘
-```
+![Architecture Overview](presentation/svg/images/architecture_overview.svg)
 
 ### `Product` trait
 
