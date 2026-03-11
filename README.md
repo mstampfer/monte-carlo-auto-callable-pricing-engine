@@ -185,7 +185,7 @@ Because the payoff is now a smooth function of S_0 (no barrier-crossing indicato
 
 ## Architecture
 
-![Architecture Overview](https://raw.githubusercontent.com/mstampfer/monte-carlo-auto-callable-pricing-engine/main/presentation/svg/images/architecture_overview.svg)
+![Architecture Overview](presentation/svg/images/architecture_overview.svg)
 
 ### `Product` trait
 
