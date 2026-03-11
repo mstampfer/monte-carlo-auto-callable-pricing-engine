@@ -1,6 +1,6 @@
 # Monte Carlo Auto-Callable Pricing Engine
 
-A high-performance structured-product pricing engine written in Rust, demonstrating how to build a correct-from-the-start Monte Carlo framework around three core abstractions — **Product**, **Propagator**, and **Engine** — with emphasis on memory layout, CPU efficiency, and cloud-friendly parallelism.
+A high-performance structured-product pricing engine written in Rust, demonstrating how to build a correct-from-the-start Monte Carlo framework around three core abstractions — **Product**, **Propagator**, and **Engine** — with emphasis on memory layout, CPU efficiency, and cloud-friendly parallelism. Includes a comparative study of **8 concurrency strategies** with a profiler TUI, an AWS hybrid architecture design, and use-case-specific strategy recommendations.
 
 The instrument priced is an **autocallable note with daily knock-in monitoring and monthly knock-out (autocall) observations**, valued with the Glasserman-Staum one-step survival technique.
 
@@ -12,7 +12,7 @@ The instrument priced is an **autocallable note with daily knock-in monitoring a
 # Build optimised binary (fat LTO, codegen-units=1)
 cargo build --release
 
-# Run the benchmark harness (all 7 concurrency strategies)
+# Run the benchmark harness (all 8 concurrency strategies)
 cargo run --release
 
 # Run with a specific strategy or path count
@@ -55,7 +55,7 @@ Sample benchmark output:
   AmericanOption (Bermudan approx): price = 3.226,  95% CI = [3.173, 3.280]
 ```
 
-All seven strategies converge to the same price within each other's 95% confidence intervals, validating the OSS estimator. S7 is intentionally slower — the 10 ms/batch throttle adds overhead proportional to the batch count to demonstrate the rate-limiting mechanism.
+All eight strategies converge to the same price within each other's 95% confidence intervals, validating the OSS estimator. S7 is intentionally slower — the 10 ms/batch throttle adds overhead proportional to the batch count to demonstrate the rate-limiting mechanism. S8 uses pure `std::thread::scope` with no async runtime dependency.
 
 ---
 
@@ -64,7 +64,7 @@ All seven strategies converge to the same price within each other's 95% confiden
 The `profiler` binary runs the same simulation and renders a post-run ratatui TUI that reveals *how* each strategy used its threads. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing and thread identity with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation).
 
 ```bash
-# Default: all 7 strategies, 200K paths, 32 batches (4× threads — exposes work-stealing)
+# Default: all 8 strategies, 200K paths, 32 batches (4× threads — exposes work-stealing)
 cargo run --release --bin profiler
 
 # More paths for sharper timelines
@@ -206,10 +206,10 @@ Because the payoff is now a smooth function of S_0 (no barrier-crossing indicato
                   │
                   ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  CONCURRENCY LAYER  (7 strategies, same engine unit of work)     │
+│  CONCURRENCY LAYER  (8 strategies, same engine unit of work)     │
 │   S1 naive_spawn · S2 JoinSet · S3 rayon_bridge                  │
 │   S4 semaphore · S5 channel_pipeline · S6 stream_buffered        │
-│   S7 stream_throttled                                            │
+│   S7 stream_throttled · S8 std_thread                            │
 │                                                                  │
 │   run_simulation() → ProfiledResult                              │
 │     tracing::info_span!("batch", …) in each closure             │
@@ -294,7 +294,7 @@ Enables cross-crate inlining of the `Propagator::propagate` hot path, which is a
 
 ## Concurrency Strategies
 
-All seven strategies use `MonteCarloEngine::run_batch` as the unit of work. Paths are split into `n_batches` independent batches (default: equal to `n_threads`; increase via `--nbatches` to expose work-stealing behaviour in the profiler).
+All eight strategies use `MonteCarloEngine::run_batch` as the unit of work. Paths are split into `n_batches` independent batches (default: equal to `n_threads`; increase via `--nbatches` to expose work-stealing behaviour in the profiler).
 
 | # | Module | tokio_stream role | CPU model | Key characteristic |
 |---|---|---|---|---|
@@ -305,6 +305,7 @@ All seven strategies use `MonteCarloEngine::run_batch` as the unit of work. Path
 | S5 | `channel_pipeline` | `ReceiverStream` + `fold` | mpsc worker pool | SSE / streaming ready |
 | S6 | `stream_buffered` | `buffer_unordered(n)` sole control | blocking thread pool | Pure stream concurrency |
 | S7 | `stream_throttled` | `throttle` + `buffer_unordered` | blocking thread pool | Cloud rate/billing quota |
+| S8 | `std_thread` | none — pure stdlib | `std::thread::scope` | Zero-dependency baseline |
 
 ### S1 — Anti-pattern
 
@@ -342,6 +343,10 @@ tokio_stream::iter(configs)
 ### S7 — stream_throttled
 
 `StreamExt::throttle` is unique to `tokio_stream` — there is no equivalent in `futures`. It limits the rate at which new batch configs are submitted to the compute pool, directly modelling a cloud billing quota without external middleware. Called via UFCS (`tokio_stream::StreamExt::throttle(stream, dur)`) to avoid method-name conflicts when `futures::StreamExt` is also in scope for `buffer_unordered`.
+
+### S8 — std_thread (scoped)
+
+Pure standard library — no Tokio, no Rayon. `std::thread::scope` spawns 8 OS threads per chunk, processing 8 chunks sequentially. Results are collected via `Mutex<Vec>`. The scope barrier guarantees all threads in a chunk join before the next chunk starts, giving 100% window purity in the completion order. Measures the abstraction cost of the runtime-based strategies and serves as a zero-dependency baseline.
 
 ---
 
@@ -400,7 +405,8 @@ src/
 │   ├── semaphore_bounded.rs      # S4: bounded concurrency
 │   ├── channel_pipeline.rs       # S5: mpsc + ReceiverStream
 │   ├── stream_buffered.rs        # S6: buffer_unordered
-│   └── stream_throttled.rs       # S7: throttle + buffer_unordered
+│   ├── stream_throttled.rs       # S7: throttle + buffer_unordered
+│   └── std_thread.rs             # S8: std::thread::scope, zero deps
 │
 └── analytics/
     ├── results.rs                # PriceResult, BenchmarkReport
@@ -464,6 +470,76 @@ let engine = MonteCarloEngine::new(
 ```
 
 The same seven concurrency strategies, the OSS variance-reduction machinery, and the profiler TUI are available to the new instrument without modification.
+
+---
+
+## Strategy Recommendations
+
+The profiler data leads to clear use-case-specific guidance:
+
+| Use Case | Best | Runner-up | Avoid |
+|---|---|---|---|
+| Interactive pricing UI | S5 Channel Pipeline | S3 Rayon Bridge | S1, S2 |
+| End-of-day batch run | S3 Rayon Bridge | S5 Channel Pipeline | S7 |
+| Lowest cloud CPU cost | S7 Stream Throttled | S4 Semaphore | S1, S2 |
+| Lowest memory | S7 Stream Throttled | S5, S8 | S2 |
+| Best generic default | S6 Stream Buffered | S5 Channel Pipeline | S1 |
+| Highest throughput | S3 Rayon Bridge | S2* | S7 |
+| Deterministic ordering | S8 std::thread | S7, S5 | S1, S2 |
+| Mixed workload server | S5 Channel Pipeline | S4 Semaphore | S1, S2, S3 |
+
+*S2 is fastest (112 ms) but has pathological tail latency and thread explosion.
+
+**Decision tree for most teams:**
+
+1. Need streaming partial results? → **S5**
+2. Dedicated batch server? → **S3**
+3. Minimal code with good defaults? → **S6**
+4. Resource-constrained or billing-sensitive? → **S7**
+5. Zero external dependencies? → **S8**
+
+Full analysis with measured data in [`presentation/notes/strategy_recommendations.md`](presentation/notes/strategy_recommendations.md).
+
+---
+
+## AWS Hybrid Architecture
+
+The local hybrid architecture (Tokio controller + Rayon workers on one machine) maps to AWS as:
+
+| Local | AWS | Role |
+|---|---|---|
+| Tokio Controller | EC2 / Fargate Task | Async I/O, gRPC fan-out, aggregation |
+| FuturesUnordered | gRPC streaming | Out-of-order completion, backpressure |
+| Rayon thread pool | EKS / ECS worker pods | CPU-bound MC simulation, work-stealing |
+| In-memory aggregation | Controller-side reducer | Streaming partials, convergence check |
+
+The gRPC boundary decouples runtimes — the controller and workers scale independently. Workers run on Spot/Fargate Spot (60–70% savings), and idempotent batches make Spot interruption a non-event. HPA scales from 0 to 100+ pods based on queue depth.
+
+Estimated cost: ~$0.003 per 1M-path pricing run. Full portfolio risk (10K instruments) completes in minutes for ~$30.
+
+Architecture diagram: [`presentation/svg/images/aws_hybrid_architecture.svg`](presentation/svg/images/aws_hybrid_architecture.svg)
+Design rationale: [`presentation/notes/slide24_aws_hybrid_architecture.md`](presentation/notes/slide24_aws_hybrid_architecture.md)
+
+---
+
+## Presentation
+
+A 25-slide deck with speaker notes covers the full study:
+
+```
+presentation/
+├── concurrency_optimization.pptx    # Main deck (25 slides)
+├── svg/images/                      # Architecture diagrams (SVG)
+│   ├── architecture_overview.svg
+│   ├── hybrid_architecture.svg
+│   └── aws_hybrid_architecture.svg
+└── notes/                           # Speaker notes (md + pdf)
+    ├── strategies.md                # All 8 strategies — code + analysis
+    ├── strategy_recommendations.md  # Use-case matrix + decision tree
+    ├── slide24_aws_hybrid_architecture.md
+    ├── slide05–slide22_*.md         # Per-slide deep-dive notes
+    └── *.pdf                        # PDF exports of all notes
+```
 
 ---
 
