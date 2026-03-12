@@ -29,7 +29,7 @@ Sample benchmark output:
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║    HSBC Monte Carlo Auto-Callable Pricing Engine — Benchmark Harness     ║
+║    Monte Carlo Auto-Callable Pricing Engine — Benchmark Harness     ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
   Instrument : Autocallable note, maturity = 1Y
@@ -72,16 +72,13 @@ cargo run --release --bin profiler -- --npaths 2_000_000
 
 # More batches to make strategy differences visible
 cargo run --release --bin profiler -- --nbatches 64 s1 s3 s6 s7
-
-# Export SVG timelines to a directory
-cargo run --release --bin profiler -- --export-timelines presentation/svg/timelines
 ```
 
 ### Tab 1 — Thread Timelines (Gantt)
 
 Gantt chart for each strategy. Each row is one OS thread; each coloured block is one batch (colour cycles through 8 colours by `batch_id`). Grey `░` = idle time. The footer shows CPU efficiency, load imbalance ratio, batch count, and final price. Dense packing = high parallelism; gaps reveal scheduling overhead or throttling.
 
-![Thread Timelines](presentation/svg/images/thread_timelines.png)
+![Thread Timelines](docs/images/thread_timelines.png)
 
 ### Tab 2 — Batch Analysis
 
@@ -91,7 +88,7 @@ Left pane lists all strategies with wall-clock times; `↑`/`↓` selects the st
 - **Batch-to-thread mapping** — compact per-thread list of executed batch IDs sorted by start time. Reveals work-stealing (multiple batches per thread) vs static assignment.
 - **Completion order** — batch IDs listed in finish-time order (wrapped, 20 per line). Out-of-order IDs indicate work-stealing or async task reordering.
 
-![Batch Analysis](presentation/svg/images/batch_analysis.png)
+![Batch Analysis](docs/images/batch_analysis.png)
 
 ### Tab 3 — Memory Analysis
 
@@ -105,14 +102,14 @@ Below, the strategy selector (left) and a memory summary (right) display:
 
 This tab makes memory profiles directly comparable — S7's flat 81 KB vs S2's 4.1 MB burst is immediately visible.
 
-![Memory Analysis](presentation/svg/images/memory_analysis.png)
+![Memory Analysis](docs/images/memory_analysis.png)
 
 ### Tab 4 — Convergence & Comparison
 
 - **Price convergence sparkline** — cumulative running price weighted by batch `n_paths`, sorted by completion time. Shows how quickly each strategy converges to the final answer. Tight early convergence (S5) means the first partial price streamed to a UI is already close to final.
 - **Strategy comparison table** — columns: wall time (ms), final price, CPU efficiency (%), load imbalance ratio, speedup vs baseline, total allocation bytes, peak heap. Rows colour-coded: green = CPU eff ≥ 95%, red = CPU eff < 70%.
 
-![Convergence & Comparison](presentation/svg/images/convergence.png)
+![Convergence & Comparison](docs/images/convergence.png)
 
 ### Keyboard shortcuts
 
@@ -207,7 +204,7 @@ Because the payoff is now a smooth function of S_0 (no barrier-crossing indicato
 
 ## Architecture
 
-![Architecture Overview](presentation/svg/images/architecture_overview.svg)
+![Architecture Overview](docs/images/architecture_overview.svg)
 
 ### `Product` trait
 
@@ -482,28 +479,6 @@ The profiler data leads to clear use-case-specific guidance:
 3. Minimal code with good defaults? → **S6**
 4. Resource-constrained or billing-sensitive? → **S7**
 5. Zero external dependencies? → **S8**
-
-Full analysis with measured data in [`presentation/notes/strategy_recommendations.md`](presentation/notes/strategy_recommendations.md).
-
----
-
-## AWS Hybrid Architecture
-
-The local hybrid architecture (Tokio controller + Rayon workers on one machine) maps to AWS as:
-
-| Local | AWS | Role |
-|---|---|---|
-| Tokio Controller | EC2 / Fargate Task | Async I/O, gRPC fan-out, aggregation |
-| FuturesUnordered | gRPC streaming | Out-of-order completion, backpressure |
-| Rayon thread pool | EKS / ECS worker pods | CPU-bound MC simulation, work-stealing |
-| In-memory aggregation | Controller-side reducer | Streaming partials, convergence check |
-
-The gRPC boundary decouples runtimes — the controller and workers scale independently. Workers run on Spot/Fargate Spot (60–70% savings), and idempotent batches make Spot interruption a non-event. HPA scales from 0 to 100+ pods based on queue depth.
-
-Estimated cost: ~$0.003 per 1M-path pricing run. Full portfolio risk (10K instruments) completes in minutes for ~$30.
-
-Architecture diagram: [`presentation/svg/images/aws_hybrid_architecture.svg`](presentation/svg/images/aws_hybrid_architecture.svg)
-Design rationale: [`presentation/notes/slide24_aws_hybrid_architecture.md`](presentation/notes/slide24_aws_hybrid_architecture.md)
 
 ---
 

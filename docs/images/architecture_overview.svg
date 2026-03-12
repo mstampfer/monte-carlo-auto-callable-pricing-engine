@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 620" font-family="Calibri, sans-serif">
+  <defs>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="108%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.08"/>
+    </filter>
+    <linearGradient id="domainGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFF7ED"/>
+      <stop offset="100%" stop-color="#FEF3E2"/>
+    </linearGradient>
+    <linearGradient id="engineGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F0F9FF"/>
+      <stop offset="100%" stop-color="#E0F2FE"/>
+    </linearGradient>
+    <linearGradient id="concGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F0FDF4"/>
+      <stop offset="100%" stop-color="#DCFCE7"/>
+    </linearGradient>
+    <linearGradient id="profGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FAF5FF"/>
+      <stop offset="100%" stop-color="#F3E8FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="620" fill="#FAFBFC" rx="8"/>
+
+  <!-- ════════════════════════════════════════ -->
+  <!-- DOMAIN LAYER -->
+  <!-- ════════════════════════════════════════ -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="30" width="720" height="170" rx="8" fill="url(#domainGrad)" stroke="#C75B39" stroke-width="2"/>
+  </g>
+  <!-- Layer label -->
+  <rect x="40" y="30" width="110" height="28" rx="4" fill="#C75B39"/>
+  <text x="95" y="49" text-anchor="middle" font-size="12" font-weight="700" fill="#FFF" letter-spacing="1">DOMAIN</text>
+
+  <!-- Subtitle -->
+  <text x="164" y="49" font-size="11" fill="#64748B" font-style="italic">pure value types</text>
+
+  <!-- Product trait box -->
+  <rect x="80" y="75" width="280" height="105" rx="6" fill="#FFF" stroke="#E2C4B5" stroke-width="1.5"/>
+  <text x="220" y="98" text-anchor="middle" font-size="14" font-weight="700" fill="#1E293B">Product</text>
+  <text x="220" y="97" text-anchor="middle" font-size="10" fill="#64748B" dy="1.2em">(trait)</text>
+  <line x1="120" y1="115" x2="320" y2="115" stroke="#E2C4B5" stroke-width="1"/>
+  <text x="220" y="137" text-anchor="middle" font-size="12" fill="#475569" font-family="Consolas, monospace">AutoCallable</text>
+  <text x="220" y="157" text-anchor="middle" font-size="12" fill="#475569" font-family="Consolas, monospace">AmericanOption</text>
+
+  <!-- Propagator trait box -->
+  <rect x="440" y="75" width="280" height="105" rx="6" fill="#FFF" stroke="#E2C4B5" stroke-width="1.5"/>
+  <text x="580" y="98" text-anchor="middle" font-size="14" font-weight="700" fill="#1E293B">Propagator</text>
+  <text x="580" y="97" text-anchor="middle" font-size="10" fill="#64748B" dy="1.2em">(trait)</text>
+  <line x1="480" y1="115" x2="680" y2="115" stroke="#E2C4B5" stroke-width="1"/>
+  <text x="580" y="137" text-anchor="middle" font-size="12" fill="#475569" font-family="Consolas, monospace">BlackScholes</text>
+  <text x="580" y="157" text-anchor="middle" font-size="12" fill="#475569" font-family="Consolas, monospace">DualTimeGrid</text>
+
+  <!-- Arrow: Domain → Engine -->
+  <line x1="220" y1="200" x2="220" y2="228" stroke="#94A3B8" stroke-width="2" marker-end="url(#arrowGray)"/>
+  <line x1="580" y1="200" x2="580" y2="228" stroke="#94A3B8" stroke-width="2" marker-end="url(#arrowGray)"/>
+  <defs>
+    <marker id="arrowGray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#94A3B8"/>
+    </marker>
+  </defs>
+
+  <!-- ════════════════════════════════════════ -->
+  <!-- ENGINE LAYER -->
+  <!-- ════════════════════════════════════════ -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="230" width="720" height="110" rx="8" fill="url(#engineGrad)" stroke="#3B82F6" stroke-width="2"/>
+  </g>
+  <rect x="40" y="230" width="110" height="28" rx="4" fill="#3B82F6"/>
+  <text x="95" y="249" text-anchor="middle" font-size="12" font-weight="700" fill="#FFF" letter-spacing="1">ENGINE</text>
+
+  <text x="400" y="270" text-anchor="middle" font-size="16" font-weight="700" fill="#1E293B" font-family="Consolas, monospace">MonteCarloEngine&lt;P, Pr&gt;</text>
+  <text x="400" y="295" text-anchor="middle" font-size="13" fill="#475569">
+    <tspan font-family="Consolas, monospace">run_batch()</tspan>
+    <tspan font-family="Calibri, sans-serif"> → </tspan>
+    <tspan font-family="Consolas, monospace">PartialResult</tspan>
+  </text>
+  <text x="400" y="318" text-anchor="middle" font-size="12" fill="#64748B">OSS estimator  +  Brownian Bridge  +  zero per-path allocation</text>
+
+  <!-- Arrow: Engine → Concurrency -->
+  <line x1="400" y1="340" x2="400" y2="368" stroke="#94A3B8" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+  <!-- ════════════════════════════════════════ -->
+  <!-- CONCURRENCY LAYER -->
+  <!-- ════════════════════════════════════════ -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="370" width="720" height="110" rx="8" fill="url(#concGrad)" stroke="#22C55E" stroke-width="2"/>
+  </g>
+  <rect x="40" y="370" width="180" height="28" rx="4" fill="#22C55E"/>
+  <text x="130" y="389" text-anchor="middle" font-size="12" font-weight="700" fill="#FFF" letter-spacing="1">CONCURRENCY</text>
+
+  <text x="400" y="415" text-anchor="middle" font-size="14" font-weight="700" fill="#1E293B">8 Strategies — Same Engine, Different Scheduling</text>
+
+  <!-- Strategy pills -->
+  <g font-size="11" font-weight="600" font-family="Consolas, monospace">
+    <rect x="80" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="115" y="446" text-anchor="middle" fill="#FFF">S1</text>
+    <rect x="160" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="195" y="446" text-anchor="middle" fill="#FFF">S2</text>
+    <rect x="240" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="275" y="446" text-anchor="middle" fill="#FFF">S3</text>
+    <rect x="320" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="355" y="446" text-anchor="middle" fill="#FFF">S4</text>
+    <rect x="400" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="435" y="446" text-anchor="middle" fill="#FFF">S5</text>
+    <rect x="480" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="515" y="446" text-anchor="middle" fill="#FFF">S6</text>
+    <rect x="560" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="595" y="446" text-anchor="middle" fill="#FFF">S7</text>
+    <rect x="640" y="430" width="70" height="24" rx="12" fill="#C75B39"/><text x="675" y="446" text-anchor="middle" fill="#FFF">S8</text>
+  </g>
+
+  <text x="400" y="472" text-anchor="middle" font-size="11" fill="#64748B">naive spawn · spawn_blocking · rayon · semaphore · channel · stream buffered · throttled · std::thread</text>
+
+  <!-- Arrow: Concurrency → Profiler -->
+  <line x1="400" y1="480" x2="400" y2="508" stroke="#94A3B8" stroke-width="2" marker-end="url(#arrowGray)"/>
+
+  <!-- ════════════════════════════════════════ -->
+  <!-- PROFILER TUI LAYER -->
+  <!-- ════════════════════════════════════════ -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="510" width="720" height="85" rx="8" fill="url(#profGrad)" stroke="#A855F7" stroke-width="2"/>
+  </g>
+  <rect x="40" y="510" width="150" height="28" rx="4" fill="#A855F7"/>
+  <text x="115" y="529" text-anchor="middle" font-size="12" font-weight="700" fill="#FFF" letter-spacing="1">PROFILER TUI</text>
+
+  <!-- Tab boxes -->
+  <g font-size="12" fill="#1E293B">
+    <rect x="80" y="550" width="140" height="28" rx="4" fill="#FFF" stroke="#D8B4FE" stroke-width="1"/>
+    <text x="150" y="568" text-anchor="middle" font-weight="600">Thread Timelines</text>
+
+    <rect x="235" y="550" width="140" height="28" rx="4" fill="#FFF" stroke="#D8B4FE" stroke-width="1"/>
+    <text x="305" y="568" text-anchor="middle" font-weight="600">Batch Analysis</text>
+
+    <rect x="390" y="550" width="150" height="28" rx="4" fill="#FFF" stroke="#D8B4FE" stroke-width="1"/>
+    <text x="465" y="568" text-anchor="middle" font-weight="600">Memory Analysis</text>
+
+    <rect x="555" y="550" width="170" height="28" rx="4" fill="#FFF" stroke="#D8B4FE" stroke-width="1"/>
+    <text x="640" y="568" text-anchor="middle" font-weight="600">Convergence</text>
+  </g>
+</svg>
