@@ -25,6 +25,10 @@ cargo run --release --bin profiler
 
 # Profiler with 64 batches (exposes work-stealing more clearly)
 cargo run --release --bin profiler -- --nbatches 64
+
+# Profiler with 20 repeats per variant (median run is shown in the TUI;
+# default is 10). Same seed across runs — measures pure wall-clock noise.
+cargo run --release --bin profiler -- --nruns 20
 ```
 
 Sample benchmark output:
@@ -126,7 +130,7 @@ The harness will pick it up automatically. Price-equivalence with the baseline i
 The `profiler` binary runs the same simulation and renders a post-run [ratatui](https://ratatui.rs/) TUI that reveals *how* each variant uses its threads, memory, and convergence behaviour. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing, thread identity, and allocation metrics with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation). A `TrackingAllocator` wrapping the global allocator records per-batch heap bytes and allocation counts.
 
 ```bash
-# Default: all known variants, 200K paths, 32 batches (4× threads — exposes work-stealing)
+# Default: all known variants, 200K paths, 32 batches, 10 runs (median shown)
 cargo run --release --bin profiler
 
 # More paths for sharper timelines
@@ -134,6 +138,17 @@ cargo run --release --bin profiler -- --npaths 2_000_000
 
 # More batches makes work-stealing patterns visible
 cargo run --release --bin profiler -- --nbatches 64
+
+# More runs for tighter wall-time confidence (default: 10)
+cargo run --release --bin profiler -- --nruns 30
+```
+
+### Multi-run smoothing (`--nruns`)
+
+Each variant is executed `--nruns N` times in sequence with the same global seed (default `N = 10`). Runs are sorted by wall-clock time and the **median run** is shown in the TUI; min and max wall times are printed to stderr alongside it. Because the seed is fixed, the price is deterministic across runs — the only thing that varies is the OS-scheduling and cache-related wall-time noise. This isolates *runtime variance* (what `--nruns` smooths) from *Monte Carlo variance* (which is controlled by `--npaths` and the OSS estimator).
+
+```text
+  rayon_bridge_baseline               ..........  median = 130 ms  (range 124–148)  price = 96.734
 ```
 
 > **Note on screenshots.** The screenshots below were captured when the project compared eight distinct concurrency strategies (`main` branch) and show what the tab layouts look like with multiple rows. On this branch they will start with a single row and grow as you add variants.

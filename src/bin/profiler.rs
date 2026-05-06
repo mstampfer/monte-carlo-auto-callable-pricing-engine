@@ -9,8 +9,14 @@
 //!   cargo run --release --bin profiler
 //!   cargo run --release --bin profiler -- --npaths 2_000_000
 //!   cargo run --release --bin profiler -- --nbatches 64
+//!   cargo run --release --bin profiler -- --nruns 20
 //!   cargo run --release --bin profiler -- baseline
 //!   cargo run --release --bin profiler -- --export-timelines presentation/timelines
+//!
+//! Each variant is run `--nruns N` times (default 10) with the same seed; the
+//! median-wall-time run is shown in the TUI and min/median/max are reported on
+//! stderr. Same seed across runs isolates wall-clock noise from MC noise — the
+//! price column is invariant across runs by construction.
 //!
 //! Tabs:
 //!   1 / Tab  — Thread Timelines (Gantt)
@@ -57,6 +63,7 @@ static ALLOC: TrackingAllocator = TrackingAllocator;
 
 const DEFAULT_N_PATHS:         usize = 200_000;
 const DEFAULT_N_BATCHES:       usize = 32;   // 4× N_THREADS — exposes work-stealing
+const DEFAULT_N_RUNS:          usize = 10;   // repeat each variant; show median run
 const N_THREADS:               usize = 8;
 const GLOBAL_SEED:             u64   = 42;
 const SPOT_INITIAL:            f64   = 100.0;
@@ -779,6 +786,18 @@ async fn main() -> anyhow::Result<()> {
         DEFAULT_N_BATCHES
     };
 
+    let n_runs: usize = if args.first().map(|s| s == "--nruns").unwrap_or(false) {
+        match args.get(1) {
+            Some(val) => match parse_npaths(val) {  // reuse same integer parser
+                Ok(n)  => { args = &args[2..]; n }
+                Err(e) => { eprintln!("error: {e}"); process::exit(1); }
+            },
+            None => { eprintln!("error: --nruns requires a value"); process::exit(1); }
+        }
+    } else {
+        DEFAULT_N_RUNS
+    };
+
     let export_dir: Option<String> = if args.first().map(|s| s == "--export-timelines").unwrap_or(false) {
         let dir = match args.get(1) {
             Some(val) if parse_variant(val).is_none() && !val.starts_with('-') => {
@@ -836,22 +855,39 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── Run simulations ───────────────────────────────────────────────────────
-    eprintln!("Running {} variant(s) — {} paths, {} batches ({} threads)...",
-        selected_variants.len(), n_paths, n_batches, N_THREADS);
+    eprintln!("Running {} variant(s) — {} paths, {} batches ({} threads), {} runs (median shown)...",
+        selected_variants.len(), n_paths, n_batches, N_THREADS, n_runs);
     let t_total = Instant::now();
 
     let mut results: Vec<ProfiledResult> = Vec::new();
     let mut peak_heap: Vec<usize> = Vec::new();
     for variant in &selected_variants {
-        eprint!("  {:35} ... ", variant.name());
-        TrackingAllocator::reset_peak();
-        let profiled = run_simulation(*variant, Arc::clone(&engine), n_paths, N_THREADS, n_batches, GLOBAL_SEED).await;
-        let peak = TrackingAllocator::peak_bytes();
-        eprintln!("{} ms  price = {:.3}",
-            profiled.price_result.wall_time.as_millis(),
-            profiled.price_result.price);
-        results.push(profiled);
-        peak_heap.push(peak);
+        eprint!("  {:35} ", variant.name());
+
+        // Run n_runs times with same seed; collect each run's profiled result + peak heap.
+        let mut runs: Vec<(ProfiledResult, usize)> = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            TrackingAllocator::reset_peak();
+            let profiled = run_simulation(
+                *variant, Arc::clone(&engine), n_paths, N_THREADS, n_batches, GLOBAL_SEED
+            ).await;
+            let peak = TrackingAllocator::peak_bytes();
+            eprint!(".");
+            runs.push((profiled, peak));
+        }
+
+        // Sort runs by wall time; pick the median run as the representative.
+        runs.sort_by_key(|(p, _)| p.price_result.wall_time);
+        let min_ms = runs.first().unwrap().0.price_result.wall_time.as_millis();
+        let max_ms = runs.last().unwrap().0.price_result.wall_time.as_millis();
+        let mid    = runs.len() / 2;
+        let (median_run, median_peak) = runs.into_iter().nth(mid).unwrap();
+        let med_ms = median_run.price_result.wall_time.as_millis();
+        let price  = median_run.price_result.price;
+
+        eprintln!("  median = {med_ms} ms  (range {min_ms}–{max_ms})  price = {price:.3}");
+        results.push(median_run);
+        peak_heap.push(median_peak);
     }
 
     eprintln!("Total run time: {} ms\n", t_total.elapsed().as_millis());
