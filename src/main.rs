@@ -28,15 +28,11 @@ const BUSINESS_DAYS_PER_MONTH: usize = 21; // ~21 daily sub-steps per month
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ALL_STRATEGIES: &[ConcurrencyStrategy] = &[
-    ConcurrencyStrategy::NaiveSpawn,
-    ConcurrencyStrategy::SpawnBlockingJoinSet,
-    ConcurrencyStrategy::RayonBridge,
-    ConcurrencyStrategy::SemaphoreBounded,
-    ConcurrencyStrategy::ChannelPipeline,
-    ConcurrencyStrategy::StreamBuffered,
-    ConcurrencyStrategy::StreamThrottled,
-    ConcurrencyStrategy::StdThread,
+/// All variants of the hybrid (tokio controller + rayon workers) strategy.
+/// Add new tweaks here as they land; the harness will profile them all in
+/// the same run for direct comparison.
+const ALL_VARIANTS: &[ConcurrencyStrategy] = &[
+    ConcurrencyStrategy::RayonBridgeBaseline,
 ];
 
 fn parse_npaths(s: &str) -> Result<usize, String> {
@@ -53,46 +49,33 @@ fn parse_npaths(s: &str) -> Result<usize, String> {
         })
 }
 
-fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
-    match arg.to_lowercase().trim_start_matches('s') {
-        "1" | "naive_spawn"             => Some(ConcurrencyStrategy::NaiveSpawn),
-        "2" | "spawn_blocking_joinset"  => Some(ConcurrencyStrategy::SpawnBlockingJoinSet),
-        "3" | "rayon_bridge"            => Some(ConcurrencyStrategy::RayonBridge),
-        "4" | "semaphore_bounded"       => Some(ConcurrencyStrategy::SemaphoreBounded),
-        "5" | "channel_pipeline"        => Some(ConcurrencyStrategy::ChannelPipeline),
-        "6" | "stream_buffered"         => Some(ConcurrencyStrategy::StreamBuffered),
-        "7" | "stream_throttled"        => Some(ConcurrencyStrategy::StreamThrottled),
-        "8" | "std_thread"             => Some(ConcurrencyStrategy::StdThread),
+fn parse_variant(arg: &str) -> Option<ConcurrencyStrategy> {
+    match arg.to_lowercase().as_str() {
+        "1" | "baseline" | "rayon_bridge_baseline" =>
+            Some(ConcurrencyStrategy::RayonBridgeBaseline),
         _ => None,
     }
 }
 
 fn print_usage() {
-    eprintln!("Usage: monte-carlo-auto-callable [--npaths N] [STRATEGY]");
+    eprintln!("Usage: monte-carlo-auto-callable [--npaths N] [VARIANT]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --npaths N    Number of Monte Carlo paths (default: {DEFAULT_N_PATHS})");
     eprintln!("                Underscores accepted: 75_000_000 or 75000000");
     eprintln!();
-    eprintln!("  STRATEGY  (omit to run all)");
-    eprintln!("    s1  naive_spawn");
-    eprintln!("    s2  spawn_blocking_joinset");
-    eprintln!("    s3  rayon_bridge");
-    eprintln!("    s4  semaphore_bounded");
-    eprintln!("    s5  channel_pipeline");
-    eprintln!("    s6  stream_buffered");
-    eprintln!("    s7  stream_throttled");
-    eprintln!("    s8  std_thread");
+    eprintln!("  VARIANT  (omit to run all variants)");
+    eprintln!("    baseline   rayon_bridge_baseline   (alias: 1)");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  cargo run --release                             # all, 200_000 paths");
-    eprintln!("  cargo run --release -- --npaths 500_000         # all, 500_000 paths");
-    eprintln!("  cargo run --release -- --npaths 75_000_000 s3   # rayon_bridge, 75M paths");
+    eprintln!("  cargo run --release                             # all variants, 200_000 paths");
+    eprintln!("  cargo run --release -- --npaths 500_000         # all variants, 500_000 paths");
+    eprintln!("  cargo run --release -- --npaths 75_000_000 baseline   # baseline, 75M paths");
 }
 
 #[tokio::main]
 async fn main() {
-    // Parse arguments: [--npaths N] [STRATEGY]
+    // Parse arguments: [--npaths N] [VARIANT]
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut args = raw.as_slice();
 
@@ -119,13 +102,13 @@ async fn main() {
         DEFAULT_N_PATHS
     };
 
-    // Optional strategy name/number
+    // Optional variant name/number
     let selected: Vec<ConcurrencyStrategy> = match args {
-        [] => ALL_STRATEGIES.to_vec(),
-        [arg] => match parse_strategy(arg) {
+        [] => ALL_VARIANTS.to_vec(),
+        [arg] => match parse_variant(arg) {
             Some(s) => vec![s],
             None => {
-                eprintln!("error: unknown strategy '{arg}'");
+                eprintln!("error: unknown variant '{arg}'");
                 eprintln!();
                 print_usage();
                 process::exit(1);
@@ -140,17 +123,18 @@ async fn main() {
     };
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║    HSBC Monte Carlo Auto-Callable Pricing Engine — Benchmark Harness     ║");
+    println!("║    HSBC Monte Carlo Auto-Callable Pricing Engine — Hybrid Runtime        ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Instrument : Autocallable note, maturity = {MATURITY_YEARS}Y");
-    println!("  S_0        : {SPOT_INITIAL}, σ = {:.0}%, r = {:.0}%, q = {:.0}%",
+    println!("  Architecture: tokio controller + rayon worker pool");
+    println!("  Instrument  : Autocallable note, maturity = {MATURITY_YEARS}Y");
+    println!("  S_0         : {SPOT_INITIAL}, σ = {:.0}%, r = {:.0}%, q = {:.0}%",
         VOLATILITY * 100.0, RISK_FREE_RATE * 100.0, DIVIDEND_YIELD * 100.0);
-    println!("  Barriers   : Call = {:.0}% of S_0, KI = {:.0}% of S_0",
+    println!("  Barriers    : Call = {:.0}% of S_0, KI = {:.0}% of S_0",
         BARRIER_CALL_FRAC * 100.0, BARRIER_KI_FRAC * 100.0);
-    println!("  Grid       : {N_MONTHLY} monthly x {BUSINESS_DAYS_PER_MONTH} daily sub-steps");
-    println!("  Paths      : {n_paths}, Threads = {N_THREADS}");
-    println!("  Method     : One-Step Survival (Glasserman-Staum) + Brownian Bridge");
+    println!("  Grid        : {N_MONTHLY} monthly x {BUSINESS_DAYS_PER_MONTH} daily sub-steps");
+    println!("  Paths       : {n_paths}, Threads = {N_THREADS}");
+    println!("  Method      : One-Step Survival (Glasserman-Staum) + Brownian Bridge");
     println!();
 
     let market_data = MarketData::new(SPOT_INITIAL, VOLATILITY, RISK_FREE_RATE, DIVIDEND_YIELD);
@@ -191,10 +175,10 @@ async fn main() {
 
     let mut report = BenchmarkReport::default();
 
-    for strategy in &selected {
-        print!("  Running {:30} ... ", strategy.name());
+    for variant in &selected {
+        print!("  Running {:30} ... ", variant.name());
         let profiled = run_simulation(
-            *strategy,
+            *variant,
             Arc::clone(&engine),
             n_paths,
             N_THREADS,
@@ -209,98 +193,9 @@ async fn main() {
 
     report.print_table();
 
-    // ── Greeks via finite difference ─────────────────────────────────────────
-    // println!("\n── Delta (finite difference, bump = 1% of S_0) ─────────────────────────");
-    // compute_delta(&engine, market_data, n_paths, GLOBAL_SEED).await;
-
     // ── AmericanOption stub — demonstrates plug-in genericity ────────────────
     println!("\n── AmericanOption stub (Bermudan approximation, same engine) ────────────");
     price_american_option(market_data, (n_paths / 10).max(1), N_THREADS, GLOBAL_SEED).await;
-}
-
-async fn compute_delta(
-    _base_engine: &Arc<MonteCarloEngine<AutoCallable, BlackScholes>>,
-    _market_data: MarketData,
-    n_paths: usize,
-    seed: u64,
-) {
-    use hsbc_monte_carlo_auto_callable::domain::DualTimeGrid;
-
-    // Barriers are FIXED at their note-inception absolute levels.
-    // Delta only bumps the current market spot (the GBM starting point).
-    let barrier_call_abs = SPOT_INITIAL * BARRIER_CALL_FRAC;
-    let barrier_ki_abs   = SPOT_INITIAL * BARRIER_KI_FRAC;
-
-    // Product uses original inception spot for its payoff formula (S_T / S_0_inception).
-    let product_template = base_engine_product(SPOT_INITIAL);
-    let tg = DualTimeGrid::new(MATURITY_YEARS, N_MONTHLY, BUSINESS_DAYS_PER_MONTH);
-
-    let eps_frac = 0.01; // 1% bump
-    let eps      = SPOT_INITIAL * eps_frac;
-
-    for bump in [eps, eps * 0.1] {
-        let bump_frac = bump / SPOT_INITIAL;
-
-        // Up bump: only market_data.spot changes (barriers stay fixed)
-        let md_up = MarketData::new(SPOT_INITIAL + bump, VOLATILITY, RISK_FREE_RATE, DIVIDEND_YIELD);
-        let eng_up = Arc::new(MonteCarloEngine::new(
-            product_template.clone(),
-            Arc::new(BlackScholes::new(&md_up)),
-            md_up,
-            tg.clone(),
-            barrier_call_abs,   // fixed
-            barrier_ki_abs,     // fixed
-            N_MONTHLY,
-            BUSINESS_DAYS_PER_MONTH,
-        ));
-
-        // Down bump: only market_data.spot changes
-        let md_dn = MarketData::new(SPOT_INITIAL - bump, VOLATILITY, RISK_FREE_RATE, DIVIDEND_YIELD);
-        let eng_dn = Arc::new(MonteCarloEngine::new(
-            product_template.clone(),
-            Arc::new(BlackScholes::new(&md_dn)),
-            md_dn,
-            tg.clone(),
-            barrier_call_abs,   // fixed
-            barrier_ki_abs,     // fixed
-            N_MONTHLY,
-            BUSINESS_DAYS_PER_MONTH,
-        ));
-
-        let n_threads = 4;
-        // Common random numbers: same seed for up/down bumps.
-        // OSS smoothing makes the payoff differentiable in S_0 (no discontinuity
-        // at the barrier), so variance largely cancels in the difference.
-        let r_up = run_simulation(
-            ConcurrencyStrategy::RayonBridge,
-            Arc::clone(&eng_up),
-            n_paths,
-            n_threads,
-            n_threads,
-            seed,
-        ).await;
-        let r_dn = run_simulation(
-            ConcurrencyStrategy::RayonBridge,
-            Arc::clone(&eng_dn),
-            n_paths,
-            n_threads,
-            n_threads,
-            seed,   // same seed → common random numbers
-        ).await;
-
-        let delta = (r_up.price_result.price - r_dn.price_result.price) / (2.0 * bump);
-        println!("  bump = {:.1}%  →  Δ = {:.4}", bump_frac * 100.0, delta);
-    }
-}
-
-fn base_engine_product(s0: f64) -> AutoCallable {
-    let coupons: Vec<f64> = (1..=N_MONTHLY)
-        .map(|k| 0.05 * k as f64 / N_MONTHLY as f64)
-        .collect();
-    let obs_dates: Vec<f64> = (1..=N_MONTHLY)
-        .map(|k| MATURITY_YEARS * k as f64 / N_MONTHLY as f64)
-        .collect();
-    AutoCallable::new(s0, NOTIONAL, BARRIER_CALL_FRAC, BARRIER_KI_FRAC, coupons, obs_dates)
 }
 
 async fn price_american_option(
@@ -337,7 +232,7 @@ async fn price_american_option(
     ));
 
     let profiled = run_simulation(
-        ConcurrencyStrategy::RayonBridge,
+        ConcurrencyStrategy::RayonBridgeBaseline,
         engine,
         n_paths,
         n_threads,

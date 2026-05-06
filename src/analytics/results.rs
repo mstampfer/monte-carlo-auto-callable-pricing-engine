@@ -51,7 +51,8 @@ impl BenchmarkReport {
 
     /// Print the benchmark table to stdout.
     pub fn print_table(&self) {
-        // Find baseline (S1 naive_spawn)
+        // Baseline = first row (rayon_bridge_baseline by convention).
+        // Speedup column shows ratio against this baseline.
         let baseline_ms = self.results.first()
             .map(|r| r.wall_time.as_millis() as f64)
             .unwrap_or(1.0);

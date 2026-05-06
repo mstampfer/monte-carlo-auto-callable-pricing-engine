@@ -73,7 +73,8 @@ fn global_histogram_range(results: &[ProfiledResult]) -> (f64, f64) {
     if lo > hi { (0.0, 1.0) } else { (lo, hi) }
 }
 
-/// Convert strategy name like "S1  naive_spawn" to "s1_naive_spawn".
+/// Convert a strategy/variant name to a filesystem-safe slug
+/// (e.g. "rayon_bridge_baseline" → "rayon_bridge_baseline").
 pub fn strategy_filename(strategy_name: &str) -> String {
     let name = strategy_name.trim().to_lowercase();
     let cleaned: String = name.chars()

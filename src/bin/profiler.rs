@@ -1,14 +1,16 @@
 //! Monte Carlo Profiler TUI
 //!
-//! Post-run visualiser for all 8 concurrency strategies.
+//! Post-run visualiser for hybrid-runtime variants. Currently the family
+//! contains a single seed variant (`rayon_bridge_baseline`); each new tweak
+//! you add to `ConcurrencyStrategy` shows up here as another row to compare
+//! against the baseline.
 //!
 //! Usage:
 //!   cargo run --release --bin profiler
 //!   cargo run --release --bin profiler -- --npaths 2_000_000
 //!   cargo run --release --bin profiler -- --nbatches 64
-//!   cargo run --release --bin profiler -- s3 s6 s7
+//!   cargo run --release --bin profiler -- baseline
 //!   cargo run --release --bin profiler -- --export-timelines presentation/timelines
-//!   cargo run --release --bin profiler -- --export-timelines presentation/timelines s3 s8
 //!
 //! Tabs:
 //!   1 / Tab  — Thread Timelines (Gantt)
@@ -16,7 +18,7 @@
 //!   3        — Memory Analysis  (per-batch alloc sparklines, peak heap)
 //!   4        — Convergence & Comparison
 //!   q / Esc  — Quit
-//!   ↑ / ↓   — Scroll (Tab 1) or select strategy (Tabs 2/3/4)
+//!   ↑ / ↓   — Scroll (Tab 1) or select variant (Tabs 2/3/4)
 
 use std::io;
 use std::process;
@@ -68,15 +70,8 @@ const MATURITY_YEARS:          f64   = 1.0;
 const N_MONTHLY:               usize = 12;
 const BUSINESS_DAYS_PER_MONTH: usize = 21;
 
-const ALL_STRATEGIES: &[ConcurrencyStrategy] = &[
-    ConcurrencyStrategy::NaiveSpawn,
-    ConcurrencyStrategy::SpawnBlockingJoinSet,
-    ConcurrencyStrategy::RayonBridge,
-    ConcurrencyStrategy::SemaphoreBounded,
-    ConcurrencyStrategy::ChannelPipeline,
-    ConcurrencyStrategy::StreamBuffered,
-    ConcurrencyStrategy::StreamThrottled,
-    ConcurrencyStrategy::StdThread,
+const ALL_VARIANTS: &[ConcurrencyStrategy] = &[
+    ConcurrencyStrategy::RayonBridgeBaseline,
 ];
 
 /// Colors cycled per batch_id in the Gantt chart.
@@ -733,16 +728,10 @@ fn parse_npaths(s: &str) -> Result<usize, String> {
         .and_then(|n| if n == 0 { Err("--npaths must be > 0".into()) } else { Ok(n) })
 }
 
-fn parse_strategy(arg: &str) -> Option<ConcurrencyStrategy> {
-    match arg.to_lowercase().trim_start_matches('s') {
-        "1" | "naive_spawn"            => Some(ConcurrencyStrategy::NaiveSpawn),
-        "2" | "spawn_blocking_joinset" => Some(ConcurrencyStrategy::SpawnBlockingJoinSet),
-        "3" | "rayon_bridge"           => Some(ConcurrencyStrategy::RayonBridge),
-        "4" | "semaphore_bounded"      => Some(ConcurrencyStrategy::SemaphoreBounded),
-        "5" | "channel_pipeline"       => Some(ConcurrencyStrategy::ChannelPipeline),
-        "6" | "stream_buffered"        => Some(ConcurrencyStrategy::StreamBuffered),
-        "7" | "stream_throttled"       => Some(ConcurrencyStrategy::StreamThrottled),
-        "8" | "std_thread"            => Some(ConcurrencyStrategy::StdThread),
+fn parse_variant(arg: &str) -> Option<ConcurrencyStrategy> {
+    match arg.to_lowercase().as_str() {
+        "1" | "baseline" | "rayon_bridge_baseline" =>
+            Some(ConcurrencyStrategy::RayonBridgeBaseline),
         _ => None,
     }
 }
@@ -792,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
 
     let export_dir: Option<String> = if args.first().map(|s| s == "--export-timelines").unwrap_or(false) {
         let dir = match args.get(1) {
-            Some(val) if parse_strategy(val).is_none() && !val.starts_with('-') => {
+            Some(val) if parse_variant(val).is_none() && !val.starts_with('-') => {
                 args = &args[2..];
                 val.clone()
             }
@@ -806,20 +795,20 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let selected_strategies: Vec<ConcurrencyStrategy> = if args.is_empty() {
-        ALL_STRATEGIES.to_vec()
+    let selected_variants: Vec<ConcurrencyStrategy> = if args.is_empty() {
+        ALL_VARIANTS.to_vec()
     } else {
-        let mut strats = Vec::new();
+        let mut variants = Vec::new();
         for arg in args {
-            match parse_strategy(arg) {
-                Some(s) => strats.push(s),
+            match parse_variant(arg) {
+                Some(s) => variants.push(s),
                 None => {
-                    eprintln!("error: unknown strategy '{arg}'");
+                    eprintln!("error: unknown variant '{arg}'");
                     process::exit(1);
                 }
             }
         }
-        strats
+        variants
     };
 
     // ── Build engine ──────────────────────────────────────────────────────────
@@ -847,16 +836,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── Run simulations ───────────────────────────────────────────────────────
-    eprintln!("Running {} strategies — {} paths, {} batches ({} threads)...",
-        selected_strategies.len(), n_paths, n_batches, N_THREADS);
+    eprintln!("Running {} variant(s) — {} paths, {} batches ({} threads)...",
+        selected_variants.len(), n_paths, n_batches, N_THREADS);
     let t_total = Instant::now();
 
     let mut results: Vec<ProfiledResult> = Vec::new();
     let mut peak_heap: Vec<usize> = Vec::new();
-    for strategy in &selected_strategies {
-        eprint!("  {:35} ... ", strategy.name());
+    for variant in &selected_variants {
+        eprint!("  {:35} ... ", variant.name());
         TrackingAllocator::reset_peak();
-        let profiled = run_simulation(*strategy, Arc::clone(&engine), n_paths, N_THREADS, n_batches, GLOBAL_SEED).await;
+        let profiled = run_simulation(*variant, Arc::clone(&engine), n_paths, N_THREADS, n_batches, GLOBAL_SEED).await;
         let peak = TrackingAllocator::peak_bytes();
         eprintln!("{} ms  price = {:.3}",
             profiled.price_result.wall_time.as_millis(),

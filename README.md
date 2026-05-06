@@ -1,6 +1,8 @@
-# Monte Carlo Auto-Callable Pricing Engine
+# Monte Carlo Auto-Callable Pricing Engine — Hybrid Runtime
 
-A high-performance structured-product pricing engine written in Rust, demonstrating how to build a correct-from-the-start Monte Carlo framework around three core abstractions — **Product**, **Propagator**, and **Engine** — with emphasis on memory layout, CPU efficiency, and cloud-friendly parallelism. Includes a comparative study of **8 concurrency strategies** with a profiler TUI, an AWS hybrid architecture design, and use-case-specific strategy recommendations.
+A high-performance structured-product pricing engine written in Rust, demonstrating how to build a correct-from-the-start Monte Carlo framework around three core abstractions — **Product**, **Propagator**, and **Engine** — with emphasis on memory layout, CPU efficiency, and cloud-friendly parallelism.
+
+This branch (`feature/hybrid-runtime`) experiments with a **single hybrid concurrency architecture**: a Tokio controller for orchestration paired with a Rayon worker pool for CPU-bound batch execution. The branch is organised so each optimisation lands as a new **variant** of the same architecture and is profiled side-by-side against the existing baseline.
 
 The instrument priced is an **autocallable note with daily knock-in monitoring and monthly knock-out (autocall) observations**, valued with the Glasserman-Staum one-step survival technique.
 
@@ -12,79 +14,141 @@ The instrument priced is an **autocallable note with daily knock-in monitoring a
 # Build optimised binary (fat LTO, codegen-units=1)
 cargo build --release
 
-# Run the benchmark harness (all 8 concurrency strategies)
+# Run the benchmark harness (all known variants)
 cargo run --release
 
-# Run with a specific strategy or path count
-cargo run --release -- --npaths 2_000_000 s3
+# Run a specific variant or override path count
+cargo run --release -- --npaths 2_000_000 baseline
 
 # Launch the post-run profiler TUI
 cargo run --release --bin profiler
 
-# Profiler with 64 batches across selected strategies
-cargo run --release --bin profiler -- --nbatches 64 s1 s3 s6 s7
+# Profiler with 64 batches (exposes work-stealing more clearly)
+cargo run --release --bin profiler -- --nbatches 64
 ```
 
 Sample benchmark output:
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║    Monte Carlo Auto-Callable Pricing Engine — Benchmark Harness     ║
+║    HSBC Monte Carlo Auto-Callable Pricing Engine — Hybrid Runtime        ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
-  Instrument : Autocallable note, maturity = 1Y
-  S_0        : 100, σ = 25%, r = 5%, q = 2%
-  Barriers   : Call = 100% of S_0, KI = 70% of S_0
-  Grid       : 12 monthly x 21 daily sub-steps
-  Paths      : 200000, Threads = 8
-  Method     : One-Step Survival (Glasserman-Staum) + Brownian Bridge
+  Architecture: tokio controller + rayon worker pool
+  Instrument  : Autocallable note, maturity = 1Y
+  S_0         : 100, σ = 25%, r = 5%, q = 2%
+  Barriers    : Call = 100% of S_0, KI = 70% of S_0
+  Grid        : 12 monthly x 21 daily sub-steps
+  Paths       : 200000, Threads = 8
+  Method      : One-Step Survival (Glasserman-Staum) + Brownian Bridge
+
+  Running rayon_bridge_baseline          ... 130 ms  price = 96.734
 
 ╔════════════════════════════════╦══════════╦═══════════╦══════════╦══════════════════╦═════════╗
 ║ Strategy                       ║    Paths ║ Time (ms) ║    Price ║      95% CI      ║ Speedup ║
 ╠════════════════════════════════╬══════════╬═══════════╬══════════╬══════════════════╬═════════╣
-║ S1  naive_spawn                ║     200K ║       127 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
-║ S2  spawn_blocking_joinset     ║     200K ║       124 ║   96.734 ║ [ 96.71, 96.76] ║    1.2× ║
-║ S3  rayon_bridge               ║     200K ║       123 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
-║ S4  semaphore_bounded(8)       ║     200K ║       124 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
-║ S5  channel_pipeline(8)        ║     200K ║       126 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
-║ S6  stream_buffered(8)         ║     200K ║       126 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
-║ S7  stream_throttled(8,10ms)   ║     200K ║       183 ║   96.734 ║ [ 96.71, 96.76] ║    0.7× ║
+║ rayon_bridge_baseline          ║     200K ║       130 ║   96.734 ║ [ 96.71, 96.76] ║    1.0× ║
 ╚════════════════════════════════╩══════════╩═══════════╩══════════╩══════════════════╩═════════╝
 
 ── AmericanOption stub (Bermudan approximation, same engine) ────────────
   AmericanOption (Bermudan approx): price = 3.226,  95% CI = [3.173, 3.280]
 ```
 
-All eight strategies converge to the same price within each other's 95% confidence intervals, validating the OSS estimator. S7 is intentionally slower — the 10 ms/batch throttle adds overhead proportional to the batch count to demonstrate the rate-limiting mechanism. S8 uses pure `std::thread::scope` with no async runtime dependency.
+The table currently shows a single row. Each new variant added to `ConcurrencyStrategy` becomes another row, profiled in the same run with identical seeds — so the price column is the regression check (all variants must agree within MC noise) and the time column is the optimisation signal.
+
+---
+
+## Hybrid Runtime Architecture
+
+The hybrid model splits responsibilities along their natural axis:
+
+| Layer | Runtime | Responsibility |
+|---|---|---|
+| Controller | Tokio multi-threaded | batch enumeration, dispatch, result aggregation, optional throttling / backpressure |
+| Workers | Rayon work-stealing | CPU-bound `MonteCarloEngine::run_batch` execution |
+| Bridge | `tokio::sync::oneshot` | per-batch result channel from a Rayon worker back to the async controller |
+
+The baseline implementation lives at `src/concurrency/rayon_bridge_baseline.rs`:
+
+```rust
+let receivers: Vec<oneshot::Receiver<PartialResult>> = configs
+    .into_iter()
+    .map(|cfg| {
+        let (tx, rx) = oneshot::channel();
+        let eng = Arc::clone(&engine);
+        rayon::spawn(move || {
+            let result = eng.run_batch(&cfg);
+            let _ = tx.send(result);
+        });
+        rx
+    })
+    .collect();
+
+tokio_stream::iter(receivers)
+    .then(|rx| async move { rx.await.expect("rayon sender dropped") })
+    .fold(PartialResult::default(), |acc, r| acc.merge(r))
+    .await
+```
+
+Rayon owns parallelism (work-stealing minimises context-switch overhead vs Tokio's general-purpose pool), `oneshot` channels relay results, and `tokio_stream::iter` + `.then()` + `.fold()` aggregate them on the controller. No `buffer_unordered` is needed — Rayon is already running all batches in parallel; an extra Tokio concurrency layer would only add scheduling overhead.
+
+### Variant family
+
+`ConcurrencyStrategy` is a closed enum of variants that all share this hybrid shape but differ in how the bridge is wired or how the workers are configured:
+
+```rust
+pub enum ConcurrencyStrategy {
+    /// Baseline: rayon::spawn dispatches batches; oneshot channels feed
+    /// tokio_stream aggregation. Reference for price-equivalence checks.
+    RayonBridgeBaseline,
+
+    // Future tweaks land here, e.g.:
+    //   RayonBridgePinned,        — explicit thread affinity per worker
+    //   RayonBridgeSimd,          — vectorised inner loop
+    //   RayonBridgeNumaAware,     — per-NUMA-node worker pools
+}
+```
+
+Every variant fulfils the same contract (same engine, same batch configs, same global seed → same `PartialResult`). The harness runs them all in one process and the profiler TUI shows them side-by-side.
+
+### Adding a tweak
+
+1. Drop a new file `src/concurrency/rayon_bridge_<name>.rs` modelled on `rayon_bridge_baseline.rs`.
+2. Add a variant to `ConcurrencyStrategy` and a dispatch arm in `src/concurrency/mod.rs`.
+3. Append it to `ALL_VARIANTS` in `src/main.rs` and `src/bin/profiler.rs`, and add a parser alias in both `parse_variant` functions.
+
+The harness will pick it up automatically. Price-equivalence with the baseline is the regression check; wall-time delta is the win.
 
 ---
 
 ## Profiler TUI
 
-The `profiler` binary runs the same simulation and renders a post-run [ratatui](https://ratatui.rs/) TUI that reveals *how* each strategy uses its threads, memory, and convergence behaviour. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing, thread identity, and allocation metrics with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation). A `TrackingAllocator` wrapping the global allocator records per-batch heap bytes and allocation counts.
+The `profiler` binary runs the same simulation and renders a post-run [ratatui](https://ratatui.rs/) TUI that reveals *how* each variant uses its threads, memory, and convergence behaviour. Instrumentation uses `tracing::info_span!` inside each batch closure; a custom `BatchCollectorLayer` subscriber captures timing, thread identity, and allocation metrics with negligible overhead (two `Instant::now()` calls per batch ≈ 0.0002% perturbation). A `TrackingAllocator` wrapping the global allocator records per-batch heap bytes and allocation counts.
 
 ```bash
-# Default: all 8 strategies, 200K paths, 32 batches (4× threads — exposes work-stealing)
+# Default: all known variants, 200K paths, 32 batches (4× threads — exposes work-stealing)
 cargo run --release --bin profiler
 
 # More paths for sharper timelines
 cargo run --release --bin profiler -- --npaths 2_000_000
 
-# More batches to make strategy differences visible
-cargo run --release --bin profiler -- --nbatches 64 s1 s3 s6 s7
+# More batches makes work-stealing patterns visible
+cargo run --release --bin profiler -- --nbatches 64
 ```
+
+> **Note on screenshots.** The screenshots below were captured when the project compared eight distinct concurrency strategies (`main` branch) and show what the tab layouts look like with multiple rows. On this branch they will start with a single row and grow as you add variants.
 
 ### Tab 1 — Thread Timelines (Gantt)
 
-Gantt chart for each strategy. Each row is one OS thread; each coloured block is one batch (colour cycles through 8 colours by `batch_id`). Grey `░` = idle time. The footer shows CPU efficiency, load imbalance ratio, batch count, and final price. Dense packing = high parallelism; gaps reveal scheduling overhead or throttling.
+Gantt chart for each variant. Each row is one OS thread; each coloured block is one batch (colour cycles through 8 colours by `batch_id`). Grey `░` = idle time. The footer shows CPU efficiency, load imbalance ratio, batch count, and final price. Dense packing = high parallelism; gaps reveal scheduling overhead.
 
 ![Thread Timelines](docs/images/thread_timelines.png)
 
 ### Tab 2 — Batch Analysis
 
-Left pane lists all strategies with wall-clock times; `↑`/`↓` selects the strategy shown in the right pane. The right pane has three sections:
+Left pane lists all variants with wall-clock times; `↑`/`↓` selects the variant shown in the right pane. The right pane has three sections:
 
-- **Duration histogram** — sparkline of batch compute-time distribution. Shared x-axis across strategies; y-axis auto-scaled with outlier truncation (prevents S7's 80 ms throttle delay from crushing scale).
+- **Duration histogram** — sparkline of batch compute-time distribution. Shared x-axis across variants; y-axis auto-scaled with outlier truncation.
 - **Batch-to-thread mapping** — compact per-thread list of executed batch IDs sorted by start time. Reveals work-stealing (multiple batches per thread) vs static assignment.
 - **Completion order** — batch IDs listed in finish-time order (wrapped, 20 per line). Out-of-order IDs indicate work-stealing or async task reordering.
 
@@ -92,22 +156,20 @@ Left pane lists all strategies with wall-clock times; `↑`/`↓` selects the st
 
 ### Tab 3 — Memory Analysis
 
-Two full-width sparklines at the top show **allocation volume** (bytes) and **allocation count** per batch for the selected strategy, with a global y-scale across all strategies for visual consistency.
+Two full-width sparklines at the top show **allocation volume** (bytes) and **allocation count** per batch for the selected variant, with a global y-scale across all variants for visual consistency.
 
-Below, the strategy selector (left) and a memory summary (right) display:
+Below, the variant selector (left) and a memory summary (right) display:
 
 - **Total alloc bytes** — gross heap allocated during the run, with per-batch average
 - **Total alloc count** — number of heap allocations, with per-batch average
 - **Peak heap** — maximum live bytes on the heap (from `TrackingAllocator::peak_bytes()`)
 
-This tab makes memory profiles directly comparable — S7's flat 81 KB vs S2's 4.1 MB burst is immediately visible.
-
 ![Memory Analysis](docs/images/memory_analysis.png)
 
 ### Tab 4 — Convergence & Comparison
 
-- **Price convergence sparkline** — cumulative running price weighted by batch `n_paths`, sorted by completion time. Shows how quickly each strategy converges to the final answer. Tight early convergence (S5) means the first partial price streamed to a UI is already close to final.
-- **Strategy comparison table** — columns: wall time (ms), final price, CPU efficiency (%), load imbalance ratio, speedup vs baseline, total allocation bytes, peak heap. Rows colour-coded: green = CPU eff ≥ 95%, red = CPU eff < 70%.
+- **Price convergence sparkline** — cumulative running price weighted by batch `n_paths`, sorted by completion time. Shows how quickly each variant converges to the final answer.
+- **Variant comparison table** — columns: wall time (ms), final price, CPU efficiency (%), load imbalance ratio, speedup vs baseline, total allocation bytes, peak heap. Rows colour-coded: green = CPU eff ≥ 95%, red = CPU eff < 70%.
 
 ![Convergence & Comparison](docs/images/convergence.png)
 
@@ -117,7 +179,7 @@ This tab makes memory profiles directly comparable — S7's flat 81 KB vs S2's 4
 |---|---|
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `1` `2` `3` `4` | Jump to tab directly |
-| `↑` / `↓` | Scroll (Tab 1) or select strategy (Tabs 2–4) |
+| `↑` / `↓` | Scroll (Tab 1) or select variant (Tabs 2–4) |
 | `q` / `Esc` | Quit |
 
 ### Key metrics
@@ -128,16 +190,7 @@ This tab makes memory profiles directly comparable — S7's flat 81 KB vs S2's 4
 | Load imbalance | max(batch duration) / mean(batch duration) |
 | Throughput | total paths / wall time |
 
-### What `--nbatches` reveals
-
-With the default `n_batches = n_threads = 8`, all strategies look identical: one batch per thread, all running simultaneously. Setting `--nbatches 32` or `--nbatches 64` makes structural differences visible:
-
-| Strategy | What appears |
-|---|---|
-| S3 rayon | Work-stealing: multiple colour segments per thread row, out-of-order completion |
-| S1 naive_spawn | Uses all CPU cores (tokio defaults to `num_cpus`), higher scheduling overhead than S3 |
-| S6 buffered | Hard concurrency cap at 8 — leaves spare cores idle on a 10-core machine |
-| S7 throttled | Wave pattern: thin coloured squares separated by large idle gaps; CPU eff ≈ 10% |
+With the default `n_batches = n_threads = 8`, work-stealing is invisible (one batch per thread). Setting `--nbatches 32` or `--nbatches 64` makes Rayon's scheduler visible: multiple colour segments per thread row, out-of-order completion in the bottom pane.
 
 ---
 
@@ -236,7 +289,7 @@ pub trait Propagator: Send + Sync + 'static {
 
 ### `MonteCarloEngine<P, Pr>`
 
-`run_batch` is **synchronous**. It takes `n_paths` and an RNG seed, returns an aggregated `PartialResult`. All async coordination happens in the concurrency layer above — the engine itself is runtime-agnostic.
+`run_batch` is **synchronous**. It takes `n_paths` and an RNG seed, returns an aggregated `PartialResult`. All async coordination happens in the concurrency layer above — the engine itself is runtime-agnostic. This is what lets every hybrid variant share the exact same compute path, so price-equivalence across variants is structural rather than coincidental.
 
 ---
 
@@ -255,7 +308,7 @@ struct BatchBuffers {
 
 ### Per-batch seeded RNG — no lock contention
 
-Each batch receives a unique seed derived from `(batch_id, global_seed)` via SplitMix64. `BoxMullerRng` holds only 256 bits of xoshiro256++ state. No mutex, no atomic. Batches are fully independent.
+Each batch receives a unique seed derived from `(batch_id, global_seed)` via SplitMix64. `BoxMullerRng` holds only 256 bits of xoshiro256++ state. No mutex, no atomic. Batches are fully independent — and identical seeds across variants is what enables structural price-equivalence.
 
 ### Clone-once Product template
 
@@ -271,64 +324,6 @@ codegen-units = 1
 ```
 
 Enables cross-crate inlining of the `Propagator::propagate` hot path, which is a single `fma`-friendly expression.
-
----
-
-## Concurrency Strategies
-
-All eight strategies use `MonteCarloEngine::run_batch` as the unit of work. Paths are split into `n_batches` independent batches (default: equal to `n_threads`; increase via `--nbatches` to expose work-stealing behaviour in the profiler).
-
-| # | Module | tokio_stream role | CPU model | Key characteristic |
-|---|---|---|---|---|
-| S1 | `naive_spawn` | none — raw `FuturesUnordered` | `tokio::spawn` (wrong) | Anti-pattern baseline |
-| S2 | `spawn_blocking_joinset` | none — `JoinSet` owns lifecycle | blocking thread pool | Structured task cancellation |
-| S3 | `rayon_bridge` | `iter` + `then` + `fold` | rayon work-stealing | Lowest CPU overhead |
-| S4 | `semaphore_bounded` | none — Semaphore is the sole controller | blocking thread pool | Hard vCPU budget |
-| S5 | `channel_pipeline` | `ReceiverStream` + `fold` | mpsc worker pool | SSE / streaming ready |
-| S6 | `stream_buffered` | `buffer_unordered(n)` sole control | blocking thread pool | Pure stream concurrency |
-| S7 | `stream_throttled` | `throttle` + `buffer_unordered` | blocking thread pool | Cloud rate/billing quota |
-| S8 | `std_thread` | none — pure stdlib | `std::thread::scope` | Zero-dependency baseline |
-
-### S1 — Anti-pattern
-
-`tokio::spawn` puts CPU work on the async executor's thread pool, stealing threads from I/O tasks. Included to make the cost measurable against the correct alternatives.
-
-### S2 — spawn_blocking + JoinSet
-
-The correct foundation. `JoinSet` provides per-task `abort_all()` — useful for risk limit checks that need to cancel in-flight batches.
-
-### S3 — rayon_bridge
-
-Rayon's work-stealing scheduler minimises context-switch overhead versus tokio's general-purpose pool. The `oneshot` channels relay results back to the async world; `tokio_stream::iter` + `.then()` + `.fold()` aggregate them cleanly. No `buffer_unordered` is needed here — rayon is already running all batches in parallel.
-
-### S4 — semaphore_bounded
-
-A single `Arc<Semaphore>` enforces a hard cap on concurrent blocking tasks. Relevant when the pricing service shares CPU with other workloads on a cloud node. A stream-based `buffer_unordered` would create a second, redundant concurrency controller.
-
-### S5 — channel_pipeline
-
-Producer–consumer via bounded `mpsc` channels. Workers call `blocking_recv` and `blocking_send` to bridge the sync/async boundary. `ReceiverStream::new(result_rx)` is the idiomatic `tokio_stream` bridge from a channel to a stream. Can be wired directly into an `axum::response::Sse` endpoint to stream partial prices to a client.
-
-### S6 — stream_buffered
-
-The most concise form. `buffer_unordered(n)` internally maintains a `FuturesUnordered` pool of size `n`, replacing both the manual `JoinSet` loop and the Semaphore with a single composable operator.
-
-```rust
-tokio_stream::iter(configs)
-    .map(|cfg| tokio::task::spawn_blocking(move || engine.run_batch(&cfg)))
-    .buffer_unordered(n_threads)
-    .map(|r| r.expect("batch panicked"))
-    .fold(PartialResult::default(), |acc, r| async move { acc.merge(r) })
-    .await
-```
-
-### S7 — stream_throttled
-
-`StreamExt::throttle` is unique to `tokio_stream` — there is no equivalent in `futures`. It limits the rate at which new batch configs are submitted to the compute pool, directly modelling a cloud billing quota without external middleware. Called via UFCS (`tokio_stream::StreamExt::throttle(stream, dur)`) to avoid method-name conflicts when `futures::StreamExt` is also in scope for `buffer_unordered`.
-
-### S8 — std_thread (scoped)
-
-Pure standard library — no Tokio, no Rayon. `std::thread::scope` spawns 8 OS threads per chunk, processing 8 chunks sequentially. Results are collected via `Mutex<Vec>`. The scope barrier guarantees all threads in a chunk join before the next chunk starts, giving 100% window purity in the completion order. Measures the abstraction cost of the runtime-based strategies and serves as a zero-dependency baseline.
 
 ---
 
@@ -356,7 +351,7 @@ A standard (non-OSS) estimator would show substantial noise at 0.1% bump due to 
 ```
 src/
 ├── lib.rs
-├── main.rs                       # Benchmark harness
+├── main.rs                       # Benchmark harness (variant comparison)
 │
 ├── bin/
 │   └── profiler.rs               # Post-run TUI profiler (ratatui)
@@ -381,14 +376,8 @@ src/
 │
 ├── concurrency/
 │   ├── mod.rs                    # ConcurrencyStrategy enum + run_simulation()
-│   ├── naive_spawn.rs            # S1: anti-pattern
-│   ├── spawn_blocking_joinset.rs # S2: structured tasks
-│   ├── rayon_bridge.rs           # S3: rayon + oneshot + stream
-│   ├── semaphore_bounded.rs      # S4: bounded concurrency
-│   ├── channel_pipeline.rs       # S5: mpsc + ReceiverStream
-│   ├── stream_buffered.rs        # S6: buffer_unordered
-│   ├── stream_throttled.rs       # S7: throttle + buffer_unordered
-│   └── std_thread.rs             # S8: std::thread::scope, zero deps
+│   └── rayon_bridge_baseline.rs  # Hybrid baseline: rayon workers + tokio bridge
+│   # Future tweaks: rayon_bridge_pinned.rs, rayon_bridge_simd.rs, ...
 │
 └── analytics/
     ├── results.rs                # PriceResult, BenchmarkReport
@@ -402,10 +391,9 @@ src/
 
 | Crate | Role |
 |---|---|
-| `tokio` | Async runtime, `spawn_blocking`, `JoinSet`, `Semaphore`, `mpsc`, `oneshot` |
-| `tokio-stream` | `StreamExt::throttle`, `ReceiverStream`, `iter` |
-| `futures` | `StreamExt::buffer_unordered`, `FuturesUnordered` |
-| `rayon` | Work-stealing thread pool for CPU-bound batches |
+| `tokio` | Async runtime, `oneshot` channels (controller side) |
+| `tokio-stream` | `iter`, `then`, `fold` (controller-side aggregation) |
+| `rayon` | Work-stealing thread pool for CPU-bound batches (worker side) |
 | `statrs` | Normal CDF (Φ) and quantile (Φ⁻¹) for OSS |
 | `rand` | Seeding utilities |
 | `tracing` | `info_span!` in each batch closure — structured per-batch instrumentation |
@@ -451,34 +439,7 @@ let engine = MonteCarloEngine::new(
 );
 ```
 
-The same seven concurrency strategies, the OSS variance-reduction machinery, and the profiler TUI are available to the new instrument without modification.
-
----
-
-## Strategy Recommendations
-
-The profiler data leads to clear use-case-specific guidance:
-
-| Use Case | Best | Runner-up | Avoid |
-|---|---|---|---|
-| Interactive pricing UI | S5 Channel Pipeline | S3 Rayon Bridge | S1, S2 |
-| End-of-day batch run | S3 Rayon Bridge | S5 Channel Pipeline | S7 |
-| Lowest cloud CPU cost | S7 Stream Throttled | S4 Semaphore | S1, S2 |
-| Lowest memory | S7 Stream Throttled | S5, S8 | S2 |
-| Best generic default | S6 Stream Buffered | S5 Channel Pipeline | S1 |
-| Highest throughput | S3 Rayon Bridge | S2* | S7 |
-| Deterministic ordering | S8 std::thread | S7, S5 | S1, S2 |
-| Mixed workload server | S5 Channel Pipeline | S4 Semaphore | S1, S2, S3 |
-
-*S2 is fastest (112 ms) but has pathological tail latency and thread explosion.
-
-**Decision tree for most teams:**
-
-1. Need streaming partial results? → **S5**
-2. Dedicated batch server? → **S3**
-3. Minimal code with good defaults? → **S6**
-4. Resource-constrained or billing-sensitive? → **S7**
-5. Zero external dependencies? → **S8**
+The OSS variance-reduction machinery, the hybrid runtime variants, and the profiler TUI all work against the new instrument without modification.
 
 ---
 
