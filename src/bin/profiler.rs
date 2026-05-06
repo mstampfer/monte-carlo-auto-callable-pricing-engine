@@ -13,10 +13,12 @@
 //!   cargo run --release --bin profiler -- baseline
 //!   cargo run --release --bin profiler -- --export-timelines presentation/timelines
 //!
-//! Each variant is run `--nruns N` times (default 10) with the same seed; the
-//! median-wall-time run is shown in the TUI and min/median/max are reported on
-//! stderr. Same seed across runs isolates wall-clock noise from MC noise — the
-//! price column is invariant across runs by construction.
+//! Each variant is run once as a warmup (discarded) and then `--nruns N` times
+//! as measured runs (default N = 10) with the same seed. The median-wall-time
+//! measured run is shown in the TUI and min/median/max are reported on stderr.
+//! Same seed across runs isolates wall-clock noise from MC noise — the price
+//! column is invariant across runs by construction. Progress dots: `w` for
+//! the warmup, `.` for each measured run.
 //!
 //! Tabs:
 //!   1 / Tab  — Thread Timelines (Gantt)
@@ -864,7 +866,16 @@ async fn main() -> anyhow::Result<()> {
     for variant in &selected_variants {
         eprint!("  {:35} ", variant.name());
 
-        // Run n_runs times with same seed; collect each run's profiled result + peak heap.
+        // Warmup run — discarded. The first run typically suffers cold cache,
+        // allocator warmup, and process-startup effects that don't represent
+        // steady-state performance. Marked 'w' in the progress dots.
+        TrackingAllocator::reset_peak();
+        let _warmup = run_simulation(
+            *variant, Arc::clone(&engine), n_paths, N_THREADS, n_batches, GLOBAL_SEED
+        ).await;
+        eprint!("w");
+
+        // Measured runs — same seed across runs; only OS scheduling/cache noise varies.
         let mut runs: Vec<(ProfiledResult, usize)> = Vec::with_capacity(n_runs);
         for _ in 0..n_runs {
             TrackingAllocator::reset_peak();

@@ -145,11 +145,13 @@ cargo run --release --bin profiler -- --nruns 30
 
 ### Multi-run smoothing (`--nruns`)
 
-Each variant is executed `--nruns N` times in sequence with the same global seed (default `N = 10`). Runs are sorted by wall-clock time and the **median run** is shown in the TUI; min and max wall times are printed to stderr alongside it. Because the seed is fixed, the price is deterministic across runs — the only thing that varies is the OS-scheduling and cache-related wall-time noise. This isolates *runtime variance* (what `--nruns` smooths) from *Monte Carlo variance* (which is controlled by `--npaths` and the OSS estimator).
+Each variant is executed once as a **warmup** (discarded — first runs typically suffer cold-cache and allocator-warmup effects that don't represent steady-state performance), then `--nruns N` times as measured runs with the same global seed (default `N = 10`). Runs are sorted by wall-clock time and the **median run** is shown in the TUI; min and max wall times are printed to stderr alongside it. Because the seed is fixed, the price is deterministic across runs — the only thing that varies is the OS-scheduling and cache-related wall-time noise. This isolates *runtime variance* (what `--nruns` smooths) from *Monte Carlo variance* (which is controlled by `--npaths` and the OSS estimator).
 
 ```text
-  rayon_bridge_baseline               ..........  median = 130 ms  (range 124–148)  price = 96.734
+  rayon_bridge_baseline               w..........  median = 130 ms  (range 124–148)  price = 96.734
 ```
+
+The leading `w` is the warmup run; each `.` after it is one measured run.
 
 > **Note on screenshots.** The screenshots below were captured when the project compared eight distinct concurrency strategies (`main` branch) and show what the tab layouts look like with multiple rows. On this branch they will start with a single row and grow as you add variants.
 
